@@ -138,12 +138,11 @@ class WitecanechatFrame(wx.Frame):
             return
         self.login_btn.Disable()
         self.register_btn.Disable()
-        self.announce("Connecting to localhost...")
-        threading.Thread(target=self._ws_connect, args=("localhost:8765", username, password, mode), daemon=True).start()
+        self.announce("Connecting to wss://witecanechat.onrender.com...")
+        threading.Thread(target=self._ws_connect, args=("wss://witecanechat.onrender.com", username, password, mode), daemon=True).start()
 
-    def _ws_connect(self, server, username, password, mode):
+    def _ws_connect(self, uri, username, password, mode):
         try:
-            uri = f"ws://{server}"
             with websockets.sync.client.connect(uri) as ws:
                 self.ws = ws
                 self.connected = True

@@ -38,12 +38,11 @@ function connect() {
     $('login-error').hidden = false;
     return;
   }
-  doConnect("localhost:8765", user, pass, 'login');
+  doConnect("wss://witecanechat.onrender.com", user, pass, 'login');
 }
 
-function doConnect(server, user, pass, mode) {
+function doConnect(wsUrl, user, pass, mode) {
   announce('Connecting...');
-  const wsUrl = 'ws://' + server;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = function() {
@@ -173,7 +172,7 @@ function doRegister() {
     $('login-error').hidden = false;
     return;
   }
-  doConnect("localhost:8765", user, pass, 'register');
+  doConnect("wss://witecanechat.onrender.com", user, pass, 'register');
 }
 
 function disconnect() {
