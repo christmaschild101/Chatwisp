@@ -1,0 +1,23 @@
+{
+  "general": {
+    "id": "general",
+    "name": "General Discussion",
+    "description": "Talk about anything and everything"
+  },
+  "technology": {
+    "id": "technology",
+    "name": "Technology",
+    "description": "Discuss technology, software, and hardware"
+  },
+  "offtopic": {
+    "id": "offtopic",
+    "name": "Off Topic",
+    "description": "Casual conversation and fun stuff"
+  },
+  "test_forum": {
+    "id": "test_forum",
+    "name": "Test forum",
+    "description": "This is where users and admins can preform tests to insure the server and other elements are working. Please do not send things in this forum unless asked by an administrater",
+    "created_at": "2026-06-21T20:02:02.659068"
+  }
+}
