@@ -21,7 +21,7 @@ Server auto-creates `server_data/` with three default forums on first run.
 
 ## Clients
 
-Both hardcode `ws://127.0.0.1:8765` — change for remote or `wss://`.
+Both hardcode `wss://chatwisp.onrender.com:8765`.
 
 - **Web client**: open `client_web/index.html` in any browser.
 - **Windows client**: `pip install wxPython && python client_windows.py`.

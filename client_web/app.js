@@ -38,7 +38,7 @@ function connect() {
     $('login-error').hidden = false;
     return;
   }
-  doConnect("wss://witecanechat.onrender.com", user, pass, 'login');
+  doConnect("wss://chatwisp.onrender.com:8765", user, pass, 'login');
 }
 
 function doConnect(wsUrl, user, pass, mode) {
@@ -172,7 +172,7 @@ function doRegister() {
     $('login-error').hidden = false;
     return;
   }
-  doConnect("wss://witecanechat.onrender.com", user, pass, 'register');
+  doConnect("wss://chatwisp.onrender.com:8765", user, pass, 'register');
 }
 
 function disconnect() {

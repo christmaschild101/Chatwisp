@@ -138,8 +138,8 @@ class ChatwispFrame(wx.Frame):
             return
         self.login_btn.Disable()
         self.register_btn.Disable()
-        self.announce("Connecting to ws://127.0.0.1:8765...")
-        threading.Thread(target=self._ws_connect, args=("ws://127.0.0.1:8765", username, password, mode), daemon=True).start()
+        self.announce("Connecting to wss://chatwisp.onrender.com:8765...")
+        threading.Thread(target=self._ws_connect, args=("wss://chatwisp.onrender.com:8765", username, password, mode), daemon=True).start()
 
     def _ws_connect(self, uri, username, password, mode):
         try:
