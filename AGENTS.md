@@ -13,15 +13,17 @@ server_data/           # JSON persistence: users.json, forums.json, topics.json,
 
 ```bash
 pip install -r requirements.txt   # only dep: websockets>=10.0
-python server.py                   # default ws://0.0.0.0:8765
+python server.py                   # default ws://0.0.0.0:8765 (or $PORT on Render)
 python server.py --host 0.0.0.0 --port 8765
 ```
+
+On Render, port comes from `$PORT` env var (default `10000`). Health check responds at `/` and `/healthz`.
 
 Server auto-creates `server_data/` with three default forums on first run.
 
 ## Clients
 
-Both hardcode `wss://chatwisp.onrender.com:8765`.
+Both hardcode `wss://chatwisp.onrender.com`.
 
 - **Web client**: open `client_web/index.html` in any browser.
 - **Windows client**: `pip install wxPython && python client_windows.py`.

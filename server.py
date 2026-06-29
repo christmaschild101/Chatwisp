@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import asyncio
+import http
 import json
 import hashlib
 import os
+import signal
 import uuid
 import sys
 from datetime import datetime
@@ -525,18 +527,28 @@ class ChatServer:
         print(f"Loading server data...")
         print(f"Server starting on ws://{self.host}:{self.port}")
         print(f"Admin accounts exist: {self.storage.has_admin()}")
-        async with websockets.serve(self.handler, self.host, self.port):
-            await asyncio.Future()
+
+        async def health_check(conn, request):
+            if request.path == "/" or request.path == "/healthz":
+                return conn.respond(http.HTTPStatus.OK, "OK\n")
+
+        loop = asyncio.get_running_loop()
+        stop = loop.create_future()
+        loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
+
+        async with websockets.serve(self.handler, self.host, self.port, process_request=health_check):
+            await stop
 
 
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Chatwisp Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8765, help="Port to listen on")
+    parser.add_argument("--port", type=int, default=None, help="Port to listen on")
     args = parser.parse_args()
 
-    server = ChatServer(host=args.host, port=args.port)
+    port = args.port if args.port is not None else int(os.environ.get("PORT", 8765))
+    server = ChatServer(host=args.host, port=port)
     try:
         asyncio.run(server.start())
     except KeyboardInterrupt:
