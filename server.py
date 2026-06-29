@@ -529,8 +529,12 @@ class ChatServer:
         print(f"Admin accounts exist: {self.storage.has_admin()}")
 
         async def health_check(conn, request):
-            if request.path == "/" or request.path == "/healthz":
+            if request.path == "/healthz":
                 return conn.respond(http.HTTPStatus.OK, "OK\n")
+            if request.path == "/":
+                upgrade = request.headers.get("Upgrade", "").lower()
+                if upgrade != "websocket":
+                    return conn.respond(http.HTTPStatus.OK, "OK\n")
 
         loop = asyncio.get_running_loop()
         stop = loop.create_future()

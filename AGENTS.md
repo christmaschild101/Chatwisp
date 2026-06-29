@@ -12,7 +12,7 @@ server_data/           # JSON persistence: users.json, forums.json, topics.json,
 ## Running
 
 ```bash
-pip install -r requirements.txt   # only dep: websockets>=10.0
+pip install -r requirements.txt   # only dep: websockets>=11.0
 python server.py                   # default ws://0.0.0.0:8765 (or $PORT on Render)
 python server.py --host 0.0.0.0 --port 8765
 ```
