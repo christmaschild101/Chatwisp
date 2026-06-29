@@ -13,13 +13,13 @@ except ImportError:
     HAS_WEBSOCKETS = False
 
 
-class WitecanechatFrame(wx.Frame):
+class ChatwispFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Witecanechat", size=(800, 600))
+        super().__init__(None, title="Chatwisp", size=(800, 600))
         self.SetMinSize((600, 400))
 
         self.statusbar = self.CreateStatusBar()
-        self.statusbar.SetStatusText("Welcome to Witecanechat")
+        self.statusbar.SetStatusText("Welcome to Chatwisp")
 
         self.main_panel = wx.Panel(self)
         self.main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -78,7 +78,7 @@ class WitecanechatFrame(wx.Frame):
         pnl = wx.Panel(self.main_panel)
         sz = wx.BoxSizer(wx.VERTICAL)
 
-        title = wx.StaticText(pnl, label="Witecanechat - Login / Register")
+        title = wx.StaticText(pnl, label="Chatwisp - Login / Register")
         f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 4); f = f.Bold()
         title.SetFont(f)
         sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
@@ -138,8 +138,8 @@ class WitecanechatFrame(wx.Frame):
             return
         self.login_btn.Disable()
         self.register_btn.Disable()
-        self.announce("Connecting to wss://witecanechat.onrender.com...")
-        threading.Thread(target=self._ws_connect, args=("wss://witecanechat.onrender.com", username, password, mode), daemon=True).start()
+        self.announce("Connecting to ws://127.0.0.1:8765...")
+        threading.Thread(target=self._ws_connect, args=("ws://127.0.0.1:8765", username, password, mode), daemon=True).start()
 
     def _ws_connect(self, uri, username, password, mode):
         try:
@@ -440,14 +440,19 @@ class WitecanechatFrame(wx.Frame):
         sz.Add(wx.StaticText(pnl, label=title_text), 0, wx.LEFT | wx.RIGHT, 10)
         sz.AddSpacer(3)
 
-        self.posts_text = wx.TextCtrl(pnl, style=wx.TE_MULTILINE | wx.TE_READONLY | wx.TE_RICH2)
+        posts_label = wx.StaticText(pnl, label="Posts in this topic:")
+        sz.Add(posts_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        sz.AddSpacer(3)
+
+        self.posts_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.posts_data = posts
         for p in posts:
-            self.posts_text.AppendText(f"{p['author']} said:\n{p['content']}\n\n")
-        sz.Add(self.posts_text, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+            self.posts_list.Append(f"{p['author']} said: {p['content']}")
+        sz.Add(self.posts_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         if not topic["closed"]:
             sz.AddSpacer(5)
-            reply_label = wx.StaticText(pnl, label="Write a Reply:")
+            reply_label = wx.StaticText(pnl, label="Your reply:")
             sz.Add(reply_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
             self.reply_text = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
             sz.Add(self.reply_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
@@ -460,7 +465,7 @@ class WitecanechatFrame(wx.Frame):
         if not topic["closed"]:
             self.reply_text.SetFocus()
         else:
-            self.posts_text.SetFocus()
+            self.posts_list.SetFocus()
         self.announce(f"Posts loaded. {len(posts)} posts.")
 
     def on_send_reply(self, event=None):
@@ -760,9 +765,9 @@ class WitecanechatFrame(wx.Frame):
         self.Destroy()
 
 
-class WitecanechatApp(wx.App):
+class ChatwispApp(wx.App):
     def OnInit(self):
-        self.frame = WitecanechatFrame()
+        self.frame = ChatwispFrame()
         self.frame.Show()
         return True
 
@@ -775,7 +780,7 @@ def main():
             wx.OK | wx.ICON_ERROR,
         )
         return
-    app = WitecanechatApp()
+    app = ChatwispApp()
     app.MainLoop()
 
 

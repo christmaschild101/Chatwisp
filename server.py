@@ -202,7 +202,7 @@ class Storage:
 
 
 class ChatServer:
-    def __init__(self, host="0.0.0.0", port=8765):
+    def __init__(self, host="127.0.0.1", port=8765):
         self.host = host
         self.port = port
         self.storage = Storage()
@@ -531,7 +531,7 @@ class ChatServer:
 
 def main():
     import argparse
-    parser = argparse.ArgumentParser(description="Witecanechat Server")
+    parser = argparse.ArgumentParser(description="Chatwisp Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8765, help="Port to listen on")
     args = parser.parse_args()

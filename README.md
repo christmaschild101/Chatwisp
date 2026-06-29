@@ -1,4 +1,4 @@
-# WitecaneChat
+# Chatwisp
 
 > **Note:** This project's name may change in the future.
 
