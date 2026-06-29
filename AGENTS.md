@@ -17,7 +17,7 @@ python server.py                   # default ws://0.0.0.0:8765 (or $PORT on Rend
 python server.py --host 0.0.0.0 --port 8765
 ```
 
-On Render, port comes from `$PORT` env var (default `10000`). Health check responds at `/` and `/healthz`.
+On Render, port comes from `$PORT` env var (default `10000`). Configure health check path to `/healthz` in the Render dashboard. Health check responds at `/healthz`.
 
 Server auto-creates `server_data/` with three default forums on first run.
 

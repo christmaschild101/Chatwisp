@@ -528,20 +528,15 @@ class ChatServer:
         print(f"Server starting on ws://{self.host}:{self.port}")
         print(f"Admin accounts exist: {self.storage.has_admin()}")
 
-        async def health_check(conn, request):
+        def health_check(connection, request):
             if request.path == "/healthz":
-                return conn.respond(http.HTTPStatus.OK, "OK\n")
-            if request.path == "/":
-                upgrade = request.headers.get("Upgrade", "").lower()
-                if upgrade != "websocket":
-                    return conn.respond(http.HTTPStatus.OK, "OK\n")
+                return connection.respond(http.HTTPStatus.OK, "OK\n")
 
         loop = asyncio.get_running_loop()
-        stop = loop.create_future()
-        loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
 
-        async with websockets.serve(self.handler, self.host, self.port, process_request=health_check):
-            await stop
+        async with websockets.serve(self.handler, self.host, self.port, process_request=health_check) as server:
+            loop.add_signal_handler(signal.SIGTERM, server.close)
+            await server.wait_closed()
 
 
 def main():
