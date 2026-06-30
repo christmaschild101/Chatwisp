@@ -72,11 +72,15 @@ class Database:
             dsn = dsn.split("://", 1)[1] if "://" in dsn else dsn
             userinfo, hostport = dsn.rsplit("@", 1)
             user, _, password = userinfo.partition(":")
+            from urllib.parse import unquote
+            user = unquote(user)
+            password = unquote(password)
             host = hostport
             port = 5432
             database = "postgres"
             if "/" in host:
                 host, _, database = host.partition("/")
+                database = unquote(database)
             if ":" in host:
                 host, _, port_str = host.rpartition(":")
                 port = int(port_str)
@@ -99,7 +103,20 @@ class Database:
         }
 
     async def connect(self):
-        self.pool = await asyncpg.create_pool(**self._connect_kwargs)
+        safe = {**self._connect_kwargs, "password": "***"}
+        print(f"Connecting to database: host={safe.get('host')} port={safe.get('port')} user={safe.get('user')} database={safe.get('database')}", flush=True)
+        for attempt in range(5):
+            try:
+                self.pool = await asyncpg.create_pool(**self._connect_kwargs)
+                break
+            except asyncpg.InvalidPasswordError:
+                raise
+            except Exception as e:
+                print(f"DB connection attempt {attempt+1} failed: {e}", flush=True)
+                if attempt < 4:
+                    await asyncio.sleep(3)
+        else:
+            raise RuntimeError("Could not connect to database after 5 attempts")
         await self._init_schema()
         await self._seed_from_json()
 
