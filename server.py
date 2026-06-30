@@ -765,12 +765,15 @@ class ChatServer:
         if not username:
             await self.send(websocket, {"type": "error", "message": "Username required"})
             return
+        if username == self.clients[websocket]["username"]:
+            await self.send(websocket, {"type": "error", "message": "Cannot delete yourself"})
+            return
         user = await self.storage.get_user(username)
         if not user:
             await self.send(websocket, {"type": "error", "message": "User not found"})
             return
-        if user.get("is_admin") and not await self.storage.has_admin():
-            await self.send(websocket, {"type": "error", "message": "Cannot delete the last admin"})
+        if user.get("super_admin"):
+            await self.send(websocket, {"type": "error", "message": "Cannot delete the original admin"})
             return
         for ws, info in list(self.clients.items()):
             if info["username"] == username:
@@ -825,6 +828,9 @@ class ChatServer:
         username = data.get("username", "").strip()
         if not username:
             await self.send(websocket, {"type": "error", "message": "Username required"})
+            return
+        if username == self.clients[websocket]["username"]:
+            await self.send(websocket, {"type": "error", "message": "Cannot demote yourself"})
             return
         user = await self.storage.get_user(username)
         if not user:

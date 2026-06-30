@@ -440,7 +440,7 @@ function userAction(user) {
   let options = 'Actions for ' + user.username + ':\n\n' +
     '1 - Ban user\n' +
     (user.banned ? '2 - Unban user\n' : '') +
-    '3 - Delete user\n';
+    (user.username !== username ? '3 - Delete user\n' : '');
   if (!user.super_admin && user.username !== username) {
     if (!user.is_admin) {
       options += '4 - Promote to Admin\n';

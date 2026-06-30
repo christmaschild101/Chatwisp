@@ -667,9 +667,10 @@ class ChatwispFrame(wx.Frame):
             unban_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "unban_user", user["username"]))
             btn_sz.Add(unban_btn, 0, wx.RIGHT, 5)
 
-        delete_btn = wx.Button(dlg, label="Delete User")
-        delete_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_delete_user(dlg, user))
-        btn_sz.Add(delete_btn, 0, wx.RIGHT, 5)
+        if user["username"] != self.username:
+            delete_btn = wx.Button(dlg, label="Delete User")
+            delete_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_delete_user(dlg, user))
+            btn_sz.Add(delete_btn, 0, wx.RIGHT, 5)
 
         if self.is_super_admin and not user.get("super_admin") and user["username"] != self.username:
             if not user.get("is_admin"):
