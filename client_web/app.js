@@ -1,6 +1,7 @@
 let ws = null;
 let username = null;
 let isAdmin = false;
+let isSuperAdmin = false;
 let currentForumId = null;
 let currentTopicId = null;
 let forumsData = [];
@@ -62,6 +63,7 @@ function doConnect(wsUrl, user, pass, mode) {
     ws = null;
     username = null;
     isAdmin = false;
+    isSuperAdmin = false;
     showView('view-login');
     hideAllSections();
     $('main-nav').hidden = true;
@@ -81,9 +83,12 @@ function handleServerMessage(data) {
   if (type === 'login_success') {
     username = data.username;
     isAdmin = data.is_admin;
+    isSuperAdmin = data.super_admin || false;
     $('main-nav').hidden = false;
     showMainMenu();
     announce('Welcome, ' + username + '!');
+  } else if (type === 'welcome') {
+    alert(data.message);
   } else if (type === 'login_error' || type === 'register_error') {
     $('login-error').textContent = data.message;
     $('login-error').hidden = false;
@@ -136,6 +141,21 @@ function handleServerMessage(data) {
   } else if (type === 'user_deleted') {
     announce(data.message || 'User deleted');
     sendMsg({ type: 'get_users' });
+  } else if (type === 'promoted') {
+    if (data.username === username) {
+      isAdmin = true;
+    }
+    announce(data.message || 'User promoted');
+    alert(data.message || 'User promoted');
+  } else if (type === 'demoted') {
+    if (data.username === username) {
+      isAdmin = false;
+    }
+    announce(data.message || 'User demoted');
+    alert(data.message || 'User demoted');
+  } else if (type === 'motd_set') {
+    announce(data.message || 'MOTD updated');
+    alert(data.message || 'MOTD updated');
   } else if (type === 'error') {
     announce('Error: ' + data.message);
     alert('Error: ' + data.message);
@@ -292,6 +312,14 @@ function renderPosts(topic, posts) {
   }
 }
 
+function showSetMotd() {
+  const motd = prompt('Enter the new Message of the Day:');
+  if (motd && motd.trim()) {
+    sendMsg({ type: 'set_motd', motd: motd.trim() });
+    announce('Setting MOTD...');
+  }
+}
+
 function showCreateTopic() {
   showView('view-create-topic');
   $('topic-title').value = '';
@@ -387,10 +415,12 @@ function renderUsers(users) {
     div.setAttribute('tabindex', '0');
     let label = 'Username: ' + u.username;
     if (u.is_admin) label += ', Admin';
+    if (u.super_admin) label += ', Super Admin';
     if (u.banned) label += ', Banned' + (u.ban_reason ? ': ' + u.ban_reason : '');
     div.setAttribute('aria-label', label);
     let html = '<div class="user-name">' + escapeHtml(u.username) + '</div><div class="user-meta">';
-    if (u.is_admin) html += '[Admin] ';
+    if (u.super_admin) html += '[Super Admin] ';
+    else if (u.is_admin) html += '[Admin] ';
     if (u.banned) html += '[Banned' + (u.ban_reason ? ': ' + escapeHtml(u.ban_reason) : '') + ']';
     html += '</div>';
     div.innerHTML = html;
@@ -407,13 +437,19 @@ function renderUsers(users) {
 }
 
 function userAction(user) {
-  const action = prompt(
-    'Actions for ' + user.username + ':\n' +
+  let options = 'Actions for ' + user.username + ':\n\n' +
     '1 - Ban user\n' +
     (user.banned ? '2 - Unban user\n' : '') +
-    '3 - Delete user\n' +
-    'Enter number:'
-  );
+    '3 - Delete user\n';
+  if (!user.super_admin && user.username !== username) {
+    if (!user.is_admin) {
+      options += '4 - Promote to Admin\n';
+    } else if (!user.super_admin) {
+      options += '5 - Demote from Admin\n';
+    }
+  }
+  options += '\nEnter number:';
+  const action = prompt(options);
   if (!action) return;
   if (action === '1') {
     const reason = prompt('Ban reason (optional, leave blank for none):');
@@ -430,6 +466,16 @@ function userAction(user) {
     if (confirm('Are you sure you want to delete user ' + user.username + '? This cannot be undone.')) {
       sendMsg({ type: 'delete_user', username: user.username });
       announce('Deleting ' + user.username + '...');
+    }
+  } else if (action === '4') {
+    if (confirm('Promote ' + user.username + ' to admin?')) {
+      sendMsg({ type: 'promote_admin', username: user.username });
+      announce('Promoting ' + user.username + '...');
+    }
+  } else if (action === '5') {
+    if (confirm('Demote ' + user.username + ' from admin?')) {
+      sendMsg({ type: 'demote_admin', username: user.username });
+      announce('Demoting ' + user.username + '...');
     }
   }
 }

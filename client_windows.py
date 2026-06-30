@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 import wx
+
+VERSION = "1.0.0"
 import json
 import threading
 import queue
@@ -15,7 +17,7 @@ except ImportError:
 
 class ChatwispFrame(wx.Frame):
     def __init__(self):
-        super().__init__(None, title="Chatwisp", size=(800, 600))
+        super().__init__(None, title=f"Chatwisp version {VERSION}", size=(800, 600))
         self.SetMinSize((600, 400))
 
         self.statusbar = self.CreateStatusBar()
@@ -29,6 +31,7 @@ class ChatwispFrame(wx.Frame):
         self.connected = False
         self.username = None
         self.is_admin = False
+        self.is_super_admin = False
         self.forum_id_stack = []
         self.topic_id_stack = []
         self.current_view = None
@@ -151,6 +154,7 @@ class ChatwispFrame(wx.Frame):
                 if response.get("type") == "login_success":
                     self.username = response["username"]
                     self.is_admin = response.get("is_admin", False)
+                    self.is_super_admin = response.get("super_admin", False)
                     self.recv_queue.put(("auth_success", response))
                     self._ws_recv_loop(ws)
                 elif response.get("type") == "register_success":
@@ -222,7 +226,9 @@ class ChatwispFrame(wx.Frame):
 
     def _handle_server_message(self, data):
         dtype = data.get("type")
-        if dtype == "forums_list":
+        if dtype == "welcome":
+            wx.MessageBox(data.get("message", ""), "Welcome", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "forums_list":
             self.show_forums(data["forums"])
         elif dtype == "topics_list":
             self.show_topics(data["forum_id"], data["topics"])
@@ -260,6 +266,19 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "user_deleted":
             self.announce(data.get("message", ""))
             self._request_users()
+        elif dtype == "promoted":
+            if data.get("username") == self.username:
+                self.is_admin = True
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Admin Promotion", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "demoted":
+            if data.get("username") == self.username:
+                self.is_admin = False
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Admin Demotion", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "motd_set":
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "MOTD Updated", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -310,6 +329,9 @@ class ChatwispFrame(wx.Frame):
             new_forum_btn = wx.Button(pnl, label="New Forum")
             new_forum_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_create_forum_dialog())
             admin_sz.Add(new_forum_btn, 0, wx.LEFT, 5)
+            set_motd_btn = wx.Button(pnl, label="Set MOTD")
+            set_motd_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_set_motd_dialog())
+            admin_sz.Add(set_motd_btn, 0, wx.LEFT, 5)
             sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
 
         list_label = wx.StaticText(pnl, label="Forums:")
@@ -552,6 +574,36 @@ class ChatwispFrame(wx.Frame):
                 self.announce("Creating forum...")
         dlg.Destroy()
 
+    # --- Set MOTD Dialog (Admin) ---
+
+    def show_set_motd_dialog(self, event=None):
+        if not self.is_admin:
+            return
+        dlg = wx.Dialog(self, title="Set Message of the Day", size=(450, 200))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        sz.Add(wx.StaticText(dlg, label="Message of the Day:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        motd_ctrl = wx.TextCtrl(dlg)
+        sz.Add(motd_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(15)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Set MOTD")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+
+        dlg.SetSizer(sz)
+        motd_ctrl.SetFocus()
+
+        if dlg.ShowModal() == wx.ID_OK:
+            motd = motd_ctrl.GetValue().strip()
+            if motd:
+                self._send({"type": "set_motd", "motd": motd})
+                self.announce("Setting MOTD...")
+        dlg.Destroy()
+
     # --- Accounts View (Admin) ---
 
     def show_users(self, users):
@@ -596,7 +648,7 @@ class ChatwispFrame(wx.Frame):
         self._do_user_select()
 
     def show_user_detail_dialog(self, user):
-        dlg = wx.Dialog(self, title=f"User: {user['username']}", size=(400, 300))
+        dlg = wx.Dialog(self, title=f"User: {user['username']}", size=(400, 340))
         sz = wx.BoxSizer(wx.VERTICAL)
 
         info = f"Username: {user['username']}\nAdmin: {'Yes' if user.get('is_admin') else 'No'}\nBanned: {'Yes' if user.get('banned') else 'No'}"
@@ -619,14 +671,21 @@ class ChatwispFrame(wx.Frame):
         delete_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_delete_user(dlg, user))
         btn_sz.Add(delete_btn, 0, wx.RIGHT, 5)
 
+        if self.is_super_admin and not user.get("super_admin") and user["username"] != self.username:
+            if not user.get("is_admin"):
+                promote_btn = wx.Button(dlg, label="Promote to Admin")
+                promote_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "promote_admin", user["username"]))
+                btn_sz.Add(promote_btn, 0, wx.RIGHT, 5)
+            elif user.get("is_admin") and not user.get("super_admin"):
+                demote_btn = wx.Button(dlg, label="Demote from Admin")
+                demote_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "demote_admin", user["username"]))
+                btn_sz.Add(demote_btn, 0, wx.RIGHT, 5)
+
         close_btn = wx.Button(dlg, wx.ID_CLOSE, label="Close")
         btn_sz.Add(close_btn, 0)
 
         sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
         dlg.SetSizer(sz)
-        ban_btn = btn_sz.GetChildren()[0].GetWindow() if not user.get("banned") else None
-        if ban_btn:
-            ban_btn.SetFocus()
         dlg.ShowModal()
         dlg.Destroy()
 

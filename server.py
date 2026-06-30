@@ -9,6 +9,8 @@ import uuid
 import sys
 from datetime import datetime
 
+VERSION = "1.0.0"
+
 try:
     import websockets
     from websockets.http11 import Response
@@ -131,6 +133,7 @@ class Database:
                     username TEXT PRIMARY KEY,
                     password_hash TEXT NOT NULL,
                     is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                    super_admin BOOLEAN NOT NULL DEFAULT FALSE,
                     banned BOOLEAN NOT NULL DEFAULT FALSE,
                     ban_reason TEXT,
                     ban_duration TEXT,
@@ -164,6 +167,15 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
+            await conn.execute("INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
         print("Database schema initialized")
 
     async def _seed_from_json(self):
@@ -190,8 +202,8 @@ class Database:
         async with self.pool.acquire() as conn:
             for username, user in users_data.items():
                 await conn.execute(
-                    "INSERT INTO users (username, password_hash, is_admin, banned, ban_reason, ban_duration, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
-                    username, user["password"], user.get("is_admin", False), user.get("banned", False),
+                    "INSERT INTO users (username, password_hash, is_admin, super_admin, banned, ban_reason, ban_duration, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+                    username, user["password"], user.get("is_admin", False), user.get("super_admin", False), user.get("banned", False),
                     user.get("ban_reason"), user.get("ban_duration"),
                     _parse_dt(user.get("created_at"))
                 )
@@ -224,6 +236,11 @@ class Database:
                     _parse_dt(post.get("created_at"))
                 )
 
+            await conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('motd', $1) ON CONFLICT DO NOTHING",
+                "Welcome to Chatwisp!"
+            )
+
         print("Database seeded from JSON files")
 
     @staticmethod
@@ -238,6 +255,7 @@ class Database:
                     "username": row["username"],
                     "password": row["password_hash"],
                     "is_admin": row["is_admin"],
+                    "super_admin": row["super_admin"],
                     "banned": row["banned"],
                     "ban_reason": row["ban_reason"],
                     "ban_duration": row["ban_duration"],
@@ -245,12 +263,12 @@ class Database:
                 }
             return None
 
-    async def create_user(self, username, password, is_admin=False):
+    async def create_user(self, username, password, is_admin=False, super_admin=False):
         try:
             async with self.pool.acquire() as conn:
                 await conn.execute(
-                    "INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, $3)",
-                    username, self._hash(password), is_admin
+                    "INSERT INTO users (username, password_hash, is_admin, super_admin) VALUES ($1, $2, $3, $4)",
+                    username, self._hash(password), is_admin, super_admin
                 )
             return True
         except asyncpg.exceptions.UniqueViolationError:
@@ -395,11 +413,12 @@ class Database:
     async def get_all_users(self):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT username, is_admin, banned, ban_reason FROM users ORDER BY username ASC"
+                "SELECT username, is_admin, super_admin, banned, ban_reason FROM users ORDER BY username ASC"
             )
             return [{
                 "username": row["username"],
                 "is_admin": row["is_admin"],
+                "super_admin": row["super_admin"],
                 "banned": row["banned"],
                 "ban_reason": row["ban_reason"],
             } for row in rows]
@@ -424,6 +443,36 @@ class Database:
         async with self.pool.acquire() as conn:
             result = await conn.execute("DELETE FROM users WHERE username = $1", username)
             return result != "DELETE 0"
+
+    async def promote_to_admin(self, username):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET is_admin = TRUE WHERE username = $1 AND is_admin = FALSE",
+                username
+            )
+            return result != "UPDATE 0"
+
+    async def demote_from_admin(self, username):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET is_admin = FALSE WHERE username = $1 AND is_admin = TRUE AND super_admin = FALSE",
+                username
+            )
+            return result != "UPDATE 0"
+
+    async def get_motd(self):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'motd'")
+            if row:
+                return row["value"]
+            return "Welcome to Chatwisp!"
+
+    async def set_motd(self, motd):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO settings (key, value) VALUES ('motd', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+                motd
+            )
 
 
 class ChatServer:
@@ -450,6 +499,11 @@ class ChatServer:
             return False
         return self.clients[websocket].get("is_admin", False)
 
+    def require_super_admin(self, websocket):
+        if not self.is_authenticated(websocket):
+            return False
+        return self.clients[websocket].get("super_admin", False)
+
     async def handle_message(self, websocket, raw):
         try:
             data = json.loads(raw)
@@ -475,6 +529,9 @@ class ChatServer:
             "unban_user": self.handle_unban_user,
             "delete_user": self.handle_delete_user,
             "create_dev_account": self.handle_create_dev_account,
+            "promote_admin": self.handle_promote_admin,
+            "demote_admin": self.handle_demote_admin,
+            "set_motd": self.handle_set_motd,
         }
 
         handler = handlers.get(msg_type)
@@ -500,11 +557,22 @@ class ChatServer:
         if not await self.storage.verify_password(username, password):
             await self.send(websocket, {"type": "login_error", "message": "Invalid username or password"})
             return
-        self.clients[websocket] = {"username": username, "is_admin": user.get("is_admin", False)}
+        is_admin = user.get("is_admin", False)
+        super_admin = user.get("super_admin", False)
+        self.clients[websocket] = {"username": username, "is_admin": is_admin, "super_admin": super_admin}
         await self.send(websocket, {
             "type": "login_success",
             "username": username,
-            "is_admin": user.get("is_admin", False),
+            "is_admin": is_admin,
+            "super_admin": super_admin,
+            "version": VERSION,
+        })
+        motd = await self.storage.get_motd()
+        await self.send(websocket, {
+            "type": "welcome",
+            "version": VERSION,
+            "motd": motd,
+            "message": f"Welcome! server version is {VERSION}. Message of the day: {motd}",
         })
 
     async def handle_register(self, websocket, data):
@@ -723,8 +791,71 @@ class ChatServer:
         if await self.storage.get_user(username):
             await self.send(websocket, {"type": "error", "message": "Username already exists"})
             return
-        await self.storage.create_user(username, password, is_admin=True)
+        await self.storage.create_user(username, password, is_admin=True, super_admin=True)
         await self.send(websocket, {"type": "dev_account_created", "message": "Developer account created"})
+
+    async def handle_promote_admin(self, websocket, data):
+        if not self.require_super_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Only the original admin can promote users"})
+            return
+        username = data.get("username", "").strip()
+        if not username:
+            await self.send(websocket, {"type": "error", "message": "Username required"})
+            return
+        user = await self.storage.get_user(username)
+        if not user:
+            await self.send(websocket, {"type": "error", "message": "User not found"})
+            return
+        if user["is_admin"]:
+            await self.send(websocket, {"type": "error", "message": "User is already an admin"})
+            return
+        if await self.storage.promote_to_admin(username):
+            for ws, info in list(self.clients.items()):
+                if info["username"] == username:
+                    info["is_admin"] = True
+                    await self.send(ws, {"type": "promoted", "message": "You have been promoted to admin"})
+            await self.send(websocket, {"type": "promoted", "username": username, "message": f"User {username} has been promoted to admin"})
+        else:
+            await self.send(websocket, {"type": "error", "message": "Failed to promote user"})
+
+    async def handle_demote_admin(self, websocket, data):
+        if not self.require_super_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Only the original admin can demote users"})
+            return
+        username = data.get("username", "").strip()
+        if not username:
+            await self.send(websocket, {"type": "error", "message": "Username required"})
+            return
+        user = await self.storage.get_user(username)
+        if not user:
+            await self.send(websocket, {"type": "error", "message": "User not found"})
+            return
+        if not user["is_admin"]:
+            await self.send(websocket, {"type": "error", "message": "User is not an admin"})
+            return
+        if user["super_admin"]:
+            await self.send(websocket, {"type": "error", "message": "Cannot demote the original admin"})
+            return
+        if await self.storage.demote_from_admin(username):
+            for ws, info in list(self.clients.items()):
+                if info["username"] == username:
+                    info["is_admin"] = False
+                    info["super_admin"] = False
+                    await self.send(ws, {"type": "demoted", "message": "You have been demoted from admin"})
+            await self.send(websocket, {"type": "demoted", "username": username, "message": f"User {username} has been demoted from admin"})
+        else:
+            await self.send(websocket, {"type": "error", "message": "Failed to demote user"})
+
+    async def handle_set_motd(self, websocket, data):
+        if not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Admin access required"})
+            return
+        motd = data.get("motd", "").strip()
+        if not motd:
+            await self.send(websocket, {"type": "error", "message": "Message of the day is required"})
+            return
+        await self.storage.set_motd(motd)
+        await self.send(websocket, {"type": "motd_set", "motd": motd, "message": "Message of the day updated"})
 
     async def handler(self, websocket):
         try:
