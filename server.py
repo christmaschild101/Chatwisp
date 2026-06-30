@@ -11,6 +11,8 @@ from datetime import datetime
 
 try:
     import websockets
+    from websockets.http11 import Response
+    from websockets.datastructures import Headers
 except ImportError:
     print("Error: websockets library not found. Run: pip install websockets")
     sys.exit(1)
@@ -26,6 +28,19 @@ DEFAULT_FORUMS = [
     {"id": "technology", "name": "Technology", "description": "Discuss technology, software, and hardware"},
     {"id": "offtopic", "name": "Off Topic", "description": "Casual conversation and fun stuff"},
 ]
+
+CLIENT_WEB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "client_web")
+
+def _read_static(path):
+    try:
+        with open(os.path.join(CLIENT_WEB_DIR, path), "r", encoding="utf-8") as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+INDEX_HTML = _read_static("index.html")
+APP_JS = _read_static("app.js")
+STYLE_CSS = _read_static("style.css")
 
 class Storage:
     def __init__(self):
@@ -525,12 +540,21 @@ class ChatServer:
 
     async def start(self):
         print(f"Loading server data...")
-        print(f"Server starting on ws://{self.host}:{self.port}")
+        print(f"Server starting on ws://{self.host}:{self.port} (web client at http://{self.host}:{self.port}/)")
         print(f"Admin accounts exist: {self.storage.has_admin()}")
 
         def health_check(connection, request):
+            if request.headers.get("Upgrade", "").lower() == "websocket":
+                return None
             if request.path == "/healthz":
                 return connection.respond(http.HTTPStatus.OK, "OK\n")
+            if request.path in ("/", "/index.html") and INDEX_HTML is not None:
+                return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), INDEX_HTML.encode("utf-8"))
+            if request.path == "/app.js" and APP_JS is not None:
+                return Response(200, "OK", Headers({"Content-Type": "application/javascript; charset=utf-8"}), APP_JS.encode("utf-8"))
+            if request.path == "/style.css" and STYLE_CSS is not None:
+                return Response(200, "OK", Headers({"Content-Type": "text/css; charset=utf-8"}), STYLE_CSS.encode("utf-8"))
+            return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"Not Found\n")
 
         loop = asyncio.get_running_loop()
 
