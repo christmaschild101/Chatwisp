@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Chatwisp — Accessible Forum</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>Chatwisp</h1>
+      <p class="tagline">An accessible, real-time forum for everyone.</p>
+    </div>
+  </header>
+
+  <nav aria-label="Main navigation">
+    <ul>
+      <li><a href="index.html" aria-current="page">Home</a></li>
+      <li><a href="https://chatwisp.onrender.com/">Web Client</a></li>
+      <li><a href="download.html">Download</a></li>
+    </ul>
+  </nav>
+
+  <main>
+    <section>
+      <h2>About</h2>
+      <p>Chatwisp is a lightweight, real-time forum application built with WebSockets. It is designed with accessibility at its core, making it easy to use with screen readers and other assistive technologies.</p>
+      <p>The server is written in Python and uses PostgreSQL for persistent storage. Two clients are available: a web client that runs in any modern browser, and a native Windows client built with wxPython.</p>
+    </section>
+
+    <section>
+      <h2>Features</h2>
+      <ul>
+        <li>Real-time messaging via WebSockets</li>
+        <li>Multiple forums and threaded topics</li>
+        <li>Admin controls: manage users, forums, and posts</li>
+        <li>Screen-reader friendly interface</li>
+        <li>Keyboard-navigable on both web and desktop</li>
+        <li>Message of the Day (MOTD) system</li>
+        <li>User accounts with admin and super-admin roles</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Try the Web Client</h2>
+      <p>No installation needed — open the web client in your browser:</p>
+      <p><a class="button" href="https://chatwisp.onrender.com/">Open Chatwisp Web Client</a></p>
+    </section>
+
+    <section>
+      <h2>Download the Desktop Client</h2>
+      <p>For a native Windows experience, download the desktop client:</p>
+      <p><a class="button" href="download.html">Download for Windows</a></p>
+    </section>
+  </main>
+
+  <footer>
+    <p>Chatwisp is free and open-source software.</p>
+  </footer>
+</body>
+</html>
