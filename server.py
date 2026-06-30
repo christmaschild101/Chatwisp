@@ -29,7 +29,8 @@ FORUMS_FILE = os.path.join(DATA_DIR, "forums.json")
 TOPICS_FILE = os.path.join(DATA_DIR, "topics.json")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
 
-DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("PGDATABASE_URL") or "postgresql://postgres.biwzptrgxgbojhgquwvo:harpertheblindgamer2026%40ca@aws-1-ca-central-1.pooler.supabase.com:5432/postgres"
+
+
 
 DEFAULT_FORUMS = [
     {"id": "general", "name": "General Discussion", "description": "Talk about anything and everything"},
@@ -60,17 +61,45 @@ def _read_json(path, default=None):
 
 
 class Database:
-    def __init__(self, dsn):
-        self.dsn = dsn
+    def __init__(self):
         self.pool = None
+        self._connect_kwargs = self._resolve_connect_kwargs()
+
+    @staticmethod
+    def _resolve_connect_kwargs():
+        dsn = os.environ.get("DATABASE_URL") or os.environ.get("PGDATABASE_URL")
+        if dsn:
+            dsn = dsn.split("://", 1)[1] if "://" in dsn else dsn
+            userinfo, hostport = dsn.rsplit("@", 1)
+            user, _, password = userinfo.partition(":")
+            host = hostport
+            port = 5432
+            database = "postgres"
+            if "/" in host:
+                host, _, database = host.partition("/")
+            if ":" in host:
+                host, _, port_str = host.rpartition(":")
+                port = int(port_str)
+            return {"host": host, "port": port, "user": user, "password": password, "database": database, "min_size": 1, "max_size": 3}
+        host = os.environ.get("PGHOST")
+        user = os.environ.get("PGUSER")
+        password = os.environ.get("PGPASSWORD")
+        if host and user and password:
+            port = int(os.environ.get("PGPORT", 5432))
+            database = os.environ.get("PGDATABASE", "postgres")
+            return {"host": host, "port": port, "user": user, "password": password, "database": database, "min_size": 1, "max_size": 3}
+        return {
+            "host": "aws-1-ca-central-1.pooler.supabase.com",
+            "port": 5432,
+            "user": "postgres.biwzptrgxgbojhgquwvo",
+            "password": "harpertheblindgamer2026@ca",
+            "database": "postgres",
+            "min_size": 1,
+            "max_size": 3,
+        }
 
     async def connect(self):
-        if not self.dsn:
-            print("Error: DATABASE_URL environment variable not set")
-            print("Set it to a PostgreSQL connection string, e.g.:")
-            print("  postgresql://user:password@host:port/database")
-            sys.exit(1)
-        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=3)
+        self.pool = await asyncpg.create_pool(**self._connect_kwargs)
         await self._init_schema()
         await self._seed_from_json()
 
@@ -384,7 +413,7 @@ class ChatServer:
     def __init__(self, host="0.0.0.0", port=8765):
         self.host = host
         self.port = port
-        self.storage = Database(DATABASE_URL)
+        self.storage = Database()
         self.clients = {}
 
     async def send(self, websocket, data):
