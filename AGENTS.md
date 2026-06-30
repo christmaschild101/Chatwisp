@@ -55,7 +55,7 @@ Only the first `create_dev_account` WebSocket message succeeds (no prior admin e
 
 ## Resetting state
 
-Drop the four tables (users, forums, topics, posts) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup.
+Drop the five tables (users, forums, topics, posts, settings) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup.
 
 ## Conventions
 
