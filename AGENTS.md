@@ -25,7 +25,7 @@ Server auto-creates `server_data/` with three default forums on first run.
 
 Both hardcode `wss://chatwisp.onrender.com`.
 
-- **Web client**: open `client_web/index.html` in any browser.
+- **Web client**: navigate to `https://chatwisp.onrender.com/` in any browser (server serves the static files from `client_web/`). Can also open `client_web/index.html` locally but same-origin fetching works better.
 - **Windows client**: `pip install wxPython && python client_windows.py`.
 
 ## Admin account
