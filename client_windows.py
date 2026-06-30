@@ -693,7 +693,8 @@ class ChatwispFrame(wx.Frame):
     def _do_simple_action(self, dlg, action, username):
         self._send({"type": action, "username": username})
         dlg.EndModal(wx.ID_CLOSE)
-        self.announce(f"{'Banning' if action == 'ban_user' else 'Unbanning'} {username}...")
+        labels = {"ban_user": "Banning", "unban_user": "Unbanning", "promote_admin": "Promoting", "demote_admin": "Demoting", "delete_user": "Deleting"}
+        self.announce(f"{labels.get(action, 'Processing')} {username}...")
 
     def _do_ban_flow(self, parent_dlg, user):
         parent_dlg.EndModal(wx.ID_CLOSE)

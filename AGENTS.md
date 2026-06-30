@@ -30,10 +30,11 @@ On Render, set `DATABASE_URL` in the Render dashboard Environment Variables sect
 
 On first run, the server creates these tables automatically:
 
-- **`users`** — username, password_hash (SHA-256), is_admin, banned, ban_reason, ban_duration, created_at
+- **`users`** — username, password_hash (SHA-256), is_admin, super_admin (only `christmas_child` has this), banned, ban_reason, ban_duration, created_at
 - **`forums`** — id, name, description, created_at
 - **`topics`** — id (UUID), forum_id (FK→forums), title, author (FK→users), closed, created_at
 - **`posts`** — id (UUID), topic_id (FK→topics), author (FK→users), content, created_at
+- **`settings`** — key (text PK), value (text) — stores server config like MOTD
 
 To reset the database: drop the tables and restart the server — it will re-seed from `server_data/*.json`.
 
