@@ -3,23 +3,43 @@
 ## Project structure
 
 ```
-server.py              # WebSocket server (Python, websockets lib)
+server.py              # WebSocket server (Python, websockets lib + asyncpg)
 client_windows.py      # Windows desktop client (wxPython)
 client_web/            # Static HTML+CSS+JS web client (no build step)
-server_data/           # JSON persistence: users.json, forums.json, topics.json, posts.json
+server_data/           # JSON seed files (read once on first database init)
 ```
 
 ## Running
 
 ```bash
-pip install -r requirements.txt   # only dep: websockets>=11.0
+pip install -r requirements.txt   # websockets>=11.0, asyncpg>=0.28.0
 python server.py                   # default ws://0.0.0.0:8765 (or $PORT on Render)
 python server.py --host 0.0.0.0 --port 8765
 ```
 
-On Render, port comes from `$PORT` env var (default `10000`). Configure health check path to `/healthz` in the Render dashboard. Health check responds at `/healthz`.
+Requires a PostgreSQL database. On first run the server reads `server_data/*.json` to seed the database, then uses PostgreSQL for all subsequent operations.
 
-Server auto-creates `server_data/` with three default forums on first run.
+## Database
+
+Connection comes from the `DATABASE_URL` env var (or `PGDATABASE_URL`). Example:
+```
+postgresql://user:password@host:port/database
+```
+
+On Render, set `DATABASE_URL` in the Render dashboard Environment Variables section.
+
+On first run, the server creates these tables automatically:
+
+- **`users`** — username, password_hash (SHA-256), is_admin, banned, ban_reason, ban_duration, created_at
+- **`forums`** — id, name, description, created_at
+- **`topics`** — id (UUID), forum_id (FK→forums), title, author (FK→users), closed, created_at
+- **`posts`** — id (UUID), topic_id (FK→topics), author (FK→users), content, created_at
+
+To reset the database: drop the tables and restart the server — it will re-seed from `server_data/*.json`.
+
+## Running locally without a database
+
+Not supported. The server requires PostgreSQL (local or remote Supabase instance).
 
 ## Clients
 
@@ -34,10 +54,10 @@ Only the first `create_dev_account` WebSocket message succeeds (no prior admin e
 
 ## Resetting state
 
-Delete `server_data/*.json` to wipe all data.
+Drop the four tables (users, forums, topics, posts) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup.
 
 ## Conventions
 
 - No tests, linting, formatter, typechecker, or CI.
 - No build step — pure Python + static files.
-- Passwords hashed with SHA-256 (stored in users.json).
+- Passwords hashed with SHA-256 (stored in database).

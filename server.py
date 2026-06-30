@@ -17,11 +17,19 @@ except ImportError:
     print("Error: websockets library not found. Run: pip install websockets")
     sys.exit(1)
 
+try:
+    import asyncpg
+except ImportError:
+    print("Error: asyncpg library not found. Run: pip install asyncpg")
+    sys.exit(1)
+
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_data")
 USERS_FILE = os.path.join(DATA_DIR, "users.json")
 FORUMS_FILE = os.path.join(DATA_DIR, "forums.json")
 TOPICS_FILE = os.path.join(DATA_DIR, "topics.json")
 POSTS_FILE = os.path.join(DATA_DIR, "posts.json")
+
+DATABASE_URL = os.environ.get("DATABASE_URL") or os.environ.get("PGDATABASE_URL") or "postgresql://postgres.biwzptrgxgbojhgquwvo:harpertheblindgamer2026%40ca@aws-1-ca-central-1.pooler.supabase.com:5432/postgres"
 
 DEFAULT_FORUMS = [
     {"id": "general", "name": "General Discussion", "description": "Talk about anything and everything"},
@@ -42,187 +50,341 @@ INDEX_HTML = _read_static("index.html")
 APP_JS = _read_static("app.js")
 STYLE_CSS = _read_static("style.css")
 
-class Storage:
-    def __init__(self):
-        os.makedirs(DATA_DIR, exist_ok=True)
-        self.users = self._load(USERS_FILE, {})
-        self.forums = self._load(FORUMS_FILE, {})
-        self.topics = self._load(TOPICS_FILE, {})
-        self.posts = self._load(POSTS_FILE, {})
+def _read_json(path, default=None):
+    if default is None:
+        default = {}
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return default
 
-        if not self.forums:
-            for forum in DEFAULT_FORUMS:
-                self.forums[forum["id"]] = dict(forum)
 
-    def _load(self, path, default):
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
-        return default
+class Database:
+    def __init__(self, dsn):
+        self.dsn = dsn
+        self.pool = None
 
-    def _save_json(self, path, data):
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
+    async def connect(self):
+        if not self.dsn:
+            print("Error: DATABASE_URL environment variable not set")
+            print("Set it to a PostgreSQL connection string, e.g.:")
+            print("  postgresql://user:password@host:port/database")
+            sys.exit(1)
+        self.pool = await asyncpg.create_pool(self.dsn, min_size=1, max_size=3)
+        await self._init_schema()
+        await self._seed_from_json()
 
-    def save_all(self):
-        self._save_json(USERS_FILE, self.users)
-        self._save_json(FORUMS_FILE, self.forums)
-        self._save_json(TOPICS_FILE, self.topics)
-        self._save_json(POSTS_FILE, self.posts)
+    async def close(self):
+        if self.pool:
+            await self.pool.close()
+
+    async def _init_schema(self):
+        async with self.pool.acquire() as conn:
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+                    banned BOOLEAN NOT NULL DEFAULT FALSE,
+                    ban_reason TEXT,
+                    ban_duration TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS forums (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS topics (
+                    id UUID PRIMARY KEY,
+                    forum_id TEXT NOT NULL REFERENCES forums(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    author TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    closed BOOLEAN NOT NULL DEFAULT FALSE,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    id UUID PRIMARY KEY,
+                    topic_id UUID NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                    author TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
+        print("Database schema initialized")
+
+    async def _seed_from_json(self):
+        async with self.pool.acquire() as conn:
+            forum_count = await conn.fetchval("SELECT COUNT(*) FROM forums")
+            if forum_count > 0:
+                return
+
+        users_data = _read_json(USERS_FILE)
+        forums_data = _read_json(FORUMS_FILE)
+        topics_data = _read_json(TOPICS_FILE)
+        posts_data = _read_json(POSTS_FILE)
+
+        now = datetime.now()
+
+        def _parse_dt(val):
+            if val:
+                try:
+                    return datetime.fromisoformat(val) if isinstance(val, str) else val
+                except (ValueError, TypeError):
+                    pass
+            return now
+
+        async with self.pool.acquire() as conn:
+            for username, user in users_data.items():
+                await conn.execute(
+                    "INSERT INTO users (username, password_hash, is_admin, banned, ban_reason, ban_duration, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING",
+                    username, user["password"], user.get("is_admin", False), user.get("banned", False),
+                    user.get("ban_reason"), user.get("ban_duration"),
+                    _parse_dt(user.get("created_at"))
+                )
+
+            if forums_data:
+                for fid, forum in forums_data.items():
+                    await conn.execute(
+                        "INSERT INTO forums (id, name, description, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                        fid, forum["name"], forum.get("description", ""),
+                        _parse_dt(forum.get("created_at"))
+                    )
+            else:
+                for forum in DEFAULT_FORUMS:
+                    await conn.execute(
+                        "INSERT INTO forums (id, name, description, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+                        forum["id"], forum["name"], forum["description"], now
+                    )
+
+            for tid, topic in topics_data.items():
+                await conn.execute(
+                    "INSERT INTO topics (id, forum_id, title, author, closed, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+                    tid, topic["forum_id"], topic["title"], topic["author"],
+                    topic.get("closed", False), _parse_dt(topic.get("created_at"))
+                )
+
+            for pid, post in posts_data.items():
+                await conn.execute(
+                    "INSERT INTO posts (id, topic_id, author, content, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+                    pid, post["topic_id"], post["author"], post["content"],
+                    _parse_dt(post.get("created_at"))
+                )
+
+        print("Database seeded from JSON files")
 
     @staticmethod
     def _hash(password):
         return hashlib.sha256(password.encode()).hexdigest()
 
-    def get_user(self, username):
-        return self.users.get(username)
+    async def get_user(self, username):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
+            if row:
+                return {
+                    "username": row["username"],
+                    "password": row["password_hash"],
+                    "is_admin": row["is_admin"],
+                    "banned": row["banned"],
+                    "ban_reason": row["ban_reason"],
+                    "ban_duration": row["ban_duration"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+            return None
 
-    def create_user(self, username, password, is_admin=False):
-        if username in self.users:
+    async def create_user(self, username, password, is_admin=False):
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    "INSERT INTO users (username, password_hash, is_admin) VALUES ($1, $2, $3)",
+                    username, self._hash(password), is_admin
+                )
+            return True
+        except asyncpg.exceptions.UniqueViolationError:
             return False
-        self.users[username] = {
-            "username": username,
-            "password": self._hash(password),
-            "is_admin": is_admin,
-            "banned": False,
-            "ban_reason": None,
-            "created_at": datetime.now().isoformat(),
-        }
-        self.save_all()
-        return True
 
-    def verify_password(self, username, password):
-        user = self.users.get(username)
+    async def verify_password(self, username, password):
+        user = await self.get_user(username)
         if not user:
             return False
         return user["password"] == self._hash(password)
 
-    def has_admin(self):
-        return any(u.get("is_admin") for u in self.users.values())
+    async def has_admin(self):
+        async with self.pool.acquire() as conn:
+            count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
+            return count > 0
 
-    def get_forums(self):
-        return list(self.forums.values())
+    async def get_forums(self):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT * FROM forums ORDER BY created_at ASC")
+            return [{
+                "id": row["id"],
+                "name": row["name"],
+                "description": row["description"],
+            } for row in rows]
 
-    def get_forum(self, forum_id):
-        return self.forums.get(forum_id)
+    async def get_forum(self, forum_id):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM forums WHERE id = $1", forum_id)
+            if row:
+                return {
+                    "id": row["id"],
+                    "name": row["name"],
+                    "description": row["description"],
+                }
+            return None
 
-    def create_forum(self, name, description):
+    async def create_forum(self, name, description):
         fid = name.lower().replace(" ", "_").replace("/", "_")
         base = fid
         counter = 1
-        while fid in self.forums:
-            fid = f"{base}_{counter}"
-            counter += 1
-        self.forums[fid] = {
-            "id": fid,
-            "name": name,
-            "description": description,
-            "created_at": datetime.now().isoformat(),
-        }
-        self.save_all()
-        return self.forums[fid]
+        async with self.pool.acquire() as conn:
+            while True:
+                existing = await conn.fetchval("SELECT id FROM forums WHERE id = $1", fid)
+                if not existing:
+                    break
+                fid = f"{base}_{counter}"
+                counter += 1
+            await conn.execute(
+                "INSERT INTO forums (id, name, description) VALUES ($1, $2, $3)",
+                fid, name, description
+            )
+        return {"id": fid, "name": name, "description": description}
 
-    def get_topics(self, forum_id):
-        return [t for t in self.topics.values() if t["forum_id"] == forum_id]
+    async def get_topics(self, forum_id):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT t.*, (SELECT COUNT(*) FROM posts WHERE topic_id = t.id) as post_count
+                FROM topics t WHERE t.forum_id = $1 ORDER BY t.created_at DESC
+            """, forum_id)
+            return [{
+                "id": str(row["id"]),
+                "title": row["title"],
+                "author": row["author"],
+                "closed": row["closed"],
+                "post_count": row["post_count"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            } for row in rows]
 
-    def get_topic(self, topic_id):
-        return self.topics.get(topic_id)
+    async def get_topic(self, topic_id):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
+            if row:
+                return {
+                    "id": str(row["id"]),
+                    "forum_id": row["forum_id"],
+                    "title": row["title"],
+                    "author": row["author"],
+                    "closed": row["closed"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+            return None
 
-    def create_topic(self, forum_id, title, author):
+    async def create_topic(self, forum_id, title, author):
         tid = str(uuid.uuid4())
-        now = datetime.now().isoformat()
-        self.topics[tid] = {
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO topics (id, forum_id, title, author) VALUES ($1, $2, $3, $4)",
+                tid, forum_id, title, author
+            )
+        return {
             "id": tid,
             "forum_id": forum_id,
             "title": title,
             "author": author,
             "closed": False,
-            "created_at": now,
+            "created_at": datetime.now().isoformat(),
         }
-        self.save_all()
-        return self.topics[tid]
 
-    def close_topic(self, topic_id):
-        topic = self.topics.get(topic_id)
-        if topic:
-            topic["closed"] = True
-            self.save_all()
-            return True
-        return False
+    async def close_topic(self, topic_id):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("UPDATE topics SET closed = TRUE WHERE id = $1", topic_id)
+            return result != "UPDATE 0"
 
-    def reopen_topic(self, topic_id):
-        topic = self.topics.get(topic_id)
-        if topic:
-            topic["closed"] = False
-            self.save_all()
-            return True
-        return False
+    async def reopen_topic(self, topic_id):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("UPDATE topics SET closed = FALSE WHERE id = $1", topic_id)
+            return result != "UPDATE 0"
 
-    def get_posts(self, topic_id):
-        return [p for p in self.posts.values() if p["topic_id"] == topic_id]
+    async def get_posts(self, topic_id):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT * FROM posts WHERE topic_id = $1 ORDER BY created_at ASC", topic_id
+            )
+            return [{
+                "id": str(row["id"]),
+                "topic_id": str(row["topic_id"]),
+                "author": row["author"],
+                "content": row["content"],
+                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            } for row in rows]
 
-    def create_post(self, topic_id, author, content):
-        topic = self.topics.get(topic_id)
+    async def create_post(self, topic_id, author, content):
+        topic = await self.get_topic(topic_id)
         if not topic:
             return None
         if topic["closed"]:
             return None
         pid = str(uuid.uuid4())
-        now = datetime.now().isoformat()
-        self.posts[pid] = {
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO posts (id, topic_id, author, content) VALUES ($1, $2, $3, $4)",
+                pid, topic_id, author, content
+            )
+        return {
             "id": pid,
             "topic_id": topic_id,
             "author": author,
             "content": content,
-            "created_at": now,
+            "created_at": datetime.now().isoformat(),
         }
-        self.save_all()
-        return self.posts[pid]
 
-    def get_all_users(self):
-        result = []
-        for u in self.users.values():
-            result.append({
-                "username": u["username"],
-                "is_admin": u.get("is_admin", False),
-                "banned": u.get("banned", False),
-                "ban_reason": u.get("ban_reason"),
-            })
-        return result
+    async def get_all_users(self):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT username, is_admin, banned, ban_reason FROM users ORDER BY username ASC"
+            )
+            return [{
+                "username": row["username"],
+                "is_admin": row["is_admin"],
+                "banned": row["banned"],
+                "ban_reason": row["ban_reason"],
+            } for row in rows]
 
-    def ban_user(self, username, reason=None, duration=None):
-        user = self.users.get(username)
-        if not user:
-            return False
-        user["banned"] = True
-        user["ban_reason"] = reason
-        user["ban_duration"] = duration
-        self.save_all()
-        return True
+    async def ban_user(self, username, reason=None, duration=None):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET banned = TRUE, ban_reason = $2, ban_duration = $3 WHERE username = $1",
+                username, reason, duration
+            )
+            return result != "UPDATE 0"
 
-    def unban_user(self, username):
-        user = self.users.get(username)
-        if not user:
-            return False
-        user["banned"] = False
-        user["ban_reason"] = None
-        user["ban_duration"] = None
-        self.save_all()
-        return True
+    async def unban_user(self, username):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE users SET banned = FALSE, ban_reason = NULL, ban_duration = NULL WHERE username = $1",
+                username
+            )
+            return result != "UPDATE 0"
 
-    def delete_user(self, username):
-        if username in self.users:
-            del self.users[username]
-            self.save_all()
-            return True
-        return False
+    async def delete_user(self, username):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM users WHERE username = $1", username)
+            return result != "DELETE 0"
 
 
 class ChatServer:
-    def __init__(self, host="127.0.0.1", port=8765):
+    def __init__(self, host="0.0.0.0", port=8765):
         self.host = host
         self.port = port
-        self.storage = Storage()
+        self.storage = Database(DATABASE_URL)
         self.clients = {}
 
     async def send(self, websocket, data):
@@ -281,7 +443,7 @@ class ChatServer:
         if not username or not password:
             await self.send(websocket, {"type": "login_error", "message": "Username and password required"})
             return
-        user = self.storage.get_user(username)
+        user = await self.storage.get_user(username)
         if not user:
             await self.send(websocket, {"type": "login_error", "message": "Invalid username or password"})
             return
@@ -289,7 +451,7 @@ class ChatServer:
             reason = user.get("ban_reason") or "No reason given"
             await self.send(websocket, {"type": "login_error", "message": f"You are banned. Reason: {reason}"})
             return
-        if not self.storage.verify_password(username, password):
+        if not await self.storage.verify_password(username, password):
             await self.send(websocket, {"type": "login_error", "message": "Invalid username or password"})
             return
         self.clients[websocket] = {"username": username, "is_admin": user.get("is_admin", False)}
@@ -311,17 +473,17 @@ class ChatServer:
         if len(password) < 4:
             await self.send(websocket, {"type": "register_error", "message": "Password must be at least 4 characters"})
             return
-        if self.storage.get_user(username):
+        if await self.storage.get_user(username):
             await self.send(websocket, {"type": "register_error", "message": "Username already exists"})
             return
-        self.storage.create_user(username, password, is_admin=False)
+        await self.storage.create_user(username, password, is_admin=False)
         await self.send(websocket, {"type": "register_success"})
 
     async def handle_get_forums(self, websocket, data):
         if not self.require_auth(websocket):
             await self.send(websocket, {"type": "error", "message": "Not authenticated"})
             return
-        forums = self.storage.get_forums()
+        forums = await self.storage.get_forums()
         await self.send(websocket, {"type": "forums_list", "forums": forums})
 
     async def handle_get_topics(self, websocket, data):
@@ -332,19 +494,8 @@ class ChatServer:
         if not forum_id:
             await self.send(websocket, {"type": "error", "message": "forum_id required"})
             return
-        topics = self.storage.get_topics(forum_id)
-        result = []
-        for t in topics:
-            posts = self.storage.get_posts(t["id"])
-            result.append({
-                "id": t["id"],
-                "title": t["title"],
-                "author": t["author"],
-                "closed": t["closed"],
-                "post_count": len(posts),
-                "created_at": t["created_at"],
-            })
-        await self.send(websocket, {"type": "topics_list", "forum_id": forum_id, "topics": result})
+        topics = await self.storage.get_topics(forum_id)
+        await self.send(websocket, {"type": "topics_list", "forum_id": forum_id, "topics": topics})
 
     async def handle_get_posts(self, websocket, data):
         if not self.require_auth(websocket):
@@ -354,11 +505,11 @@ class ChatServer:
         if not topic_id:
             await self.send(websocket, {"type": "error", "message": "topic_id required"})
             return
-        topic = self.storage.get_topic(topic_id)
+        topic = await self.storage.get_topic(topic_id)
         if not topic:
             await self.send(websocket, {"type": "error", "message": "Topic not found"})
             return
-        posts = self.storage.get_posts(topic_id)
+        posts = await self.storage.get_posts(topic_id)
         await self.send(websocket, {
             "type": "posts_list",
             "topic_id": topic_id,
@@ -376,14 +527,14 @@ class ChatServer:
         if not forum_id or not title:
             await self.send(websocket, {"type": "error", "message": "forum_id and title required"})
             return
-        forum = self.storage.get_forum(forum_id)
+        forum = await self.storage.get_forum(forum_id)
         if not forum:
             await self.send(websocket, {"type": "error", "message": "Forum not found"})
             return
         user = self.clients[websocket]
-        topic = self.storage.create_topic(forum_id, title, user["username"])
+        topic = await self.storage.create_topic(forum_id, title, user["username"])
         if content:
-            post = self.storage.create_post(topic["id"], user["username"], content)
+            await self.storage.create_post(topic["id"], user["username"], content)
         await self.send(websocket, {"type": "topic_created", "topic": topic})
 
     async def handle_create_post(self, websocket, data):
@@ -395,7 +546,7 @@ class ChatServer:
         if not topic_id or not content:
             await self.send(websocket, {"type": "error", "message": "topic_id and content required"})
             return
-        topic = self.storage.get_topic(topic_id)
+        topic = await self.storage.get_topic(topic_id)
         if not topic:
             await self.send(websocket, {"type": "error", "message": "Topic not found"})
             return
@@ -403,7 +554,7 @@ class ChatServer:
             await self.send(websocket, {"type": "error", "message": "Cannot post in a closed topic"})
             return
         user = self.clients[websocket]
-        post = self.storage.create_post(topic_id, user["username"], content)
+        post = await self.storage.create_post(topic_id, user["username"], content)
         if not post:
             await self.send(websocket, {"type": "error", "message": "Failed to create post"})
             return
@@ -418,7 +569,7 @@ class ChatServer:
         if not name:
             await self.send(websocket, {"type": "error", "message": "Forum name required"})
             return
-        forum = self.storage.create_forum(name, description)
+        forum = await self.storage.create_forum(name, description)
         await self.send(websocket, {"type": "forum_created", "forum": forum})
 
     async def handle_close_topic(self, websocket, data):
@@ -429,7 +580,7 @@ class ChatServer:
         if not topic_id:
             await self.send(websocket, {"type": "error", "message": "topic_id required"})
             return
-        if self.storage.close_topic(topic_id):
+        if await self.storage.close_topic(topic_id):
             await self.send(websocket, {"type": "topic_closed", "topic_id": topic_id})
         else:
             await self.send(websocket, {"type": "error", "message": "Topic not found"})
@@ -442,7 +593,7 @@ class ChatServer:
         if not topic_id:
             await self.send(websocket, {"type": "error", "message": "topic_id required"})
             return
-        if self.storage.reopen_topic(topic_id):
+        if await self.storage.reopen_topic(topic_id):
             await self.send(websocket, {"type": "topic_reopened", "topic_id": topic_id})
         else:
             await self.send(websocket, {"type": "error", "message": "Topic not found"})
@@ -451,7 +602,7 @@ class ChatServer:
         if not self.require_admin(websocket):
             await self.send(websocket, {"type": "error", "message": "Admin access required"})
             return
-        users = self.storage.get_all_users()
+        users = await self.storage.get_all_users()
         await self.send(websocket, {"type": "users_list", "users": users})
 
     async def handle_ban_user(self, websocket, data):
@@ -470,7 +621,7 @@ class ChatServer:
         if duration:
             await self.send(websocket, {"type": "error", "message": "Ban duration feature is not implemented yet"})
             return
-        if self.storage.ban_user(username, reason, duration):
+        if await self.storage.ban_user(username, reason, duration):
             await self.send(websocket, {"type": "banned", "username": username, "message": f"User {username} has been banned"})
             for ws, info in list(self.clients.items()):
                 if info["username"] == username:
@@ -487,7 +638,7 @@ class ChatServer:
         if not username:
             await self.send(websocket, {"type": "error", "message": "Username required"})
             return
-        if self.storage.unban_user(username):
+        if await self.storage.unban_user(username):
             await self.send(websocket, {"type": "unbanned", "username": username, "message": f"User {username} has been unbanned"})
         else:
             await self.send(websocket, {"type": "error", "message": "User not found"})
@@ -500,22 +651,22 @@ class ChatServer:
         if not username:
             await self.send(websocket, {"type": "error", "message": "Username required"})
             return
-        user = self.storage.get_user(username)
+        user = await self.storage.get_user(username)
         if not user:
             await self.send(websocket, {"type": "error", "message": "User not found"})
             return
-        if user.get("is_admin") and not self.storage.has_admin():
+        if user.get("is_admin") and not await self.storage.has_admin():
             await self.send(websocket, {"type": "error", "message": "Cannot delete the last admin"})
             return
         for ws, info in list(self.clients.items()):
             if info["username"] == username:
                 await self.send(ws, {"type": "error", "message": "Your account has been deleted"})
                 await ws.close()
-        self.storage.delete_user(username)
+        await self.storage.delete_user(username)
         await self.send(websocket, {"type": "user_deleted", "username": username, "message": f"User {username} has been deleted"})
 
     async def handle_create_dev_account(self, websocket, data):
-        if self.storage.has_admin():
+        if await self.storage.has_admin():
             await self.send(websocket, {"type": "error", "message": "A developer account already exists"})
             return
         username = data.get("username", "").strip()
@@ -523,10 +674,10 @@ class ChatServer:
         if not username or not password:
             await self.send(websocket, {"type": "error", "message": "Username and password required"})
             return
-        if self.storage.get_user(username):
+        if await self.storage.get_user(username):
             await self.send(websocket, {"type": "error", "message": "Username already exists"})
             return
-        self.storage.create_user(username, password, is_admin=True)
+        await self.storage.create_user(username, password, is_admin=True)
         await self.send(websocket, {"type": "dev_account_created", "message": "Developer account created"})
 
     async def handler(self, websocket):
@@ -539,9 +690,9 @@ class ChatServer:
             self.clients.pop(websocket, None)
 
     async def start(self):
-        print(f"Loading server data...")
+        await self.storage.connect()
         print(f"Server starting on ws://{self.host}:{self.port} (web client at http://{self.host}:{self.port}/)")
-        print(f"Admin accounts exist: {self.storage.has_admin()}")
+        print(f"Admin accounts exist: {await self.storage.has_admin()}")
 
         def health_check(connection, request):
             if request.headers.get("Upgrade", "").lower() == "websocket":
@@ -558,9 +709,12 @@ class ChatServer:
 
         loop = asyncio.get_running_loop()
 
-        async with websockets.serve(self.handler, self.host, self.port, process_request=health_check) as server:
-            loop.add_signal_handler(signal.SIGTERM, server.close)
-            await server.wait_closed()
+        try:
+            async with websockets.serve(self.handler, self.host, self.port, process_request=health_check) as server:
+                loop.add_signal_handler(signal.SIGTERM, server.close)
+                await server.wait_closed()
+        finally:
+            await self.storage.close()
 
 
 def main():
