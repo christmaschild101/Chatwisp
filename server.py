@@ -9,7 +9,7 @@ import uuid
 import sys
 from datetime import datetime
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 
 try:
     import websockets
@@ -173,7 +173,20 @@ class Database:
                     value TEXT NOT NULL
                 )
             """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS dms (
+                    id UUID PRIMARY KEY,
+                    sender TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    recipient TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                    read BOOLEAN NOT NULL DEFAULT FALSE
+                )
+            """)
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_recipient ON dms(recipient, read)")
+            await conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
             await conn.execute("INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
         print("Database schema initialized")
@@ -333,6 +346,7 @@ class Database:
                 "title": row["title"],
                 "author": row["author"],
                 "closed": row["closed"],
+                "admin_only": row["admin_only"],
                 "post_count": row["post_count"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             } for row in rows]
@@ -347,16 +361,17 @@ class Database:
                     "title": row["title"],
                     "author": row["author"],
                     "closed": row["closed"],
+                    "admin_only": row["admin_only"],
                     "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 }
             return None
 
-    async def create_topic(self, forum_id, title, author):
+    async def create_topic(self, forum_id, title, author, admin_only=False):
         tid = str(uuid.uuid4())
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO topics (id, forum_id, title, author) VALUES ($1, $2, $3, $4)",
-                tid, forum_id, title, author
+                "INSERT INTO topics (id, forum_id, title, author, admin_only) VALUES ($1, $2, $3, $4, $5)",
+                tid, forum_id, title, author, admin_only
             )
         return {
             "id": tid,
@@ -364,6 +379,7 @@ class Database:
             "title": title,
             "author": author,
             "closed": False,
+            "admin_only": admin_only,
             "created_at": datetime.now().isoformat(),
         }
 
@@ -474,6 +490,104 @@ class Database:
                 motd
             )
 
+    async def search_users(self, query):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                "SELECT username FROM users WHERE username ILIKE $1 ORDER BY username ASC LIMIT 20",
+                f"%{query}%"
+            )
+            return [row["username"] for row in rows]
+
+    async def send_dm(self, sender, recipient, content):
+        mid = str(uuid.uuid4())
+        now = datetime.now()
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO dms (id, sender, recipient, content, created_at) VALUES ($1, $2, $3, $4, $5)",
+                mid, sender, recipient, content, now
+            )
+        return {"id": mid, "sender": sender, "recipient": recipient, "content": content, "created_at": now.isoformat()}
+
+    async def get_dm_conversation(self, user_a, user_b, limit=50):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT id, sender, recipient, content, created_at FROM dms
+                   WHERE (sender = $1 AND recipient = $2) OR (sender = $2 AND recipient = $1)
+                   ORDER BY created_at DESC LIMIT $3""",
+                user_a, user_b, limit
+            )
+            result = []
+            for r in reversed(rows):
+                result.append({
+                    "id": str(r["id"]),
+                    "sender": r["sender"],
+                    "recipient": r["recipient"],
+                    "content": r["content"],
+                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                })
+            return result
+
+    async def get_dm_contacts(self, username):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch(
+                """SELECT DISTINCT ON (pair) pair, sender, recipient, content, created_at, read FROM (
+                     SELECT
+                       GREATEST(sender, recipient) || ':' || LEAST(sender, recipient) AS pair,
+                       sender, recipient, content, created_at, read
+                     FROM dms
+                     WHERE sender = $1 OR recipient = $1
+                     ORDER BY pair, created_at DESC
+                   ) sub ORDER BY pair, created_at DESC""",
+                username
+            )
+            contacts = []
+            for r in rows:
+                other = r["recipient"] if r["sender"] == username else r["sender"]
+                contacts.append({
+                    "username": other,
+                    "last_message": r["content"],
+                    "last_time": r["created_at"].isoformat() if r["created_at"] else None,
+                })
+            return contacts
+
+    async def mark_dms_read(self, recipient, sender):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE dms SET read = TRUE WHERE recipient = $1 AND sender = $2 AND read = FALSE",
+                recipient, sender
+            )
+
+    async def get_total_unread(self, username):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(
+                "SELECT COUNT(*) FROM dms WHERE recipient = $1 AND read = FALSE", username
+            )
+
+    async def delete_post(self, post_id):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
+            return result != "DELETE 0"
+
+    async def delete_topic(self, topic_id):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute("DELETE FROM topics WHERE id = $1", topic_id)
+            return result != "DELETE 0"
+
+    async def update_password(self, username, new_password):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET password_hash = $1 WHERE username = $2",
+                self._hash(new_password), username
+            )
+            return True
+
+    async def set_topic_admin_only(self, topic_id, value):
+        async with self.pool.acquire() as conn:
+            result = await conn.execute(
+                "UPDATE topics SET admin_only = $1 WHERE id = $2", value, topic_id
+            )
+            return result != "UPDATE 0"
+
 
 class ChatServer:
     def __init__(self, host="0.0.0.0", port=8765):
@@ -532,6 +646,16 @@ class ChatServer:
             "promote_admin": self.handle_promote_admin,
             "demote_admin": self.handle_demote_admin,
             "set_motd": self.handle_set_motd,
+            "search_users": self.handle_search_users,
+            "send_dm": self.handle_send_dm,
+            "get_dm_conversation": self.handle_get_dm_conversation,
+            "get_dm_contacts": self.handle_get_dm_contacts,
+            "mark_dms_read": self.handle_mark_dms_read,
+            "delete_post": self.handle_delete_post,
+            "delete_topic": self.handle_delete_topic,
+            "set_topic_admin_only": self.handle_set_topic_admin_only,
+            "remove_topic_admin_only": self.handle_remove_topic_admin_only,
+            "reset_password": self.handle_reset_password,
         }
 
         handler = handlers.get(msg_type)
@@ -566,6 +690,11 @@ class ChatServer:
             "is_admin": is_admin,
             "super_admin": super_admin,
             "version": VERSION,
+        })
+        unread = await self.storage.get_total_unread(username)
+        await self.send(websocket, {
+            "type": "unread_dms",
+            "count": unread,
         })
         motd = await self.storage.get_motd()
         await self.send(websocket, {
@@ -646,7 +775,8 @@ class ChatServer:
             await self.send(websocket, {"type": "error", "message": "Forum not found"})
             return
         user = self.clients[websocket]
-        topic = await self.storage.create_topic(forum_id, title, user["username"])
+        admin_only = data.get("admin_only", False) and user.get("is_admin", False)
+        topic = await self.storage.create_topic(forum_id, title, user["username"], admin_only=admin_only)
         if content:
             await self.storage.create_post(topic["id"], user["username"], content)
         await self.send(websocket, {"type": "topic_created", "topic": topic})
@@ -666,6 +796,9 @@ class ChatServer:
             return
         if topic["closed"]:
             await self.send(websocket, {"type": "error", "message": "Cannot post in a closed topic"})
+            return
+        if topic["admin_only"] and not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "This topic is admin only. Only admins can post here."})
             return
         user = self.clients[websocket]
         post = await self.storage.create_post(topic_id, user["username"], content)
@@ -862,6 +995,145 @@ class ChatServer:
             return
         await self.storage.set_motd(motd)
         await self.send(websocket, {"type": "motd_set", "motd": motd, "message": "Message of the day updated"})
+
+    async def handle_search_users(self, websocket, data):
+        if not self.require_auth(websocket):
+            await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+            return
+        query = data.get("query", "").strip()
+        if not query:
+            await self.send(websocket, {"type": "error", "message": "Search query required"})
+            return
+        results = await self.storage.search_users(query)
+        username_filter = self.clients[websocket]["username"]
+        results = [u for u in results if u != username_filter]
+        await self.send(websocket, {"type": "search_results", "users": results})
+
+    async def handle_send_dm(self, websocket, data):
+        if not self.require_auth(websocket):
+            await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+            return
+        sender = self.clients[websocket]["username"]
+        recipient = data.get("recipient", "").strip()
+        content = data.get("content", "").strip()
+        if not recipient or not content:
+            await self.send(websocket, {"type": "error", "message": "Recipient and content required"})
+            return
+        if recipient == sender:
+            await self.send(websocket, {"type": "error", "message": "Cannot send a DM to yourself"})
+            return
+        user = await self.storage.get_user(recipient)
+        if not user:
+            await self.send(websocket, {"type": "error", "message": "User not found"})
+            return
+        dm = await self.storage.send_dm(sender, recipient, content)
+        await self.send(websocket, {"type": "dm_sent", "dm": dm})
+        # Forward to recipient if online
+        for ws, info in list(self.clients.items()):
+            if info["username"] == recipient:
+                await self.send(ws, {"type": "dm_received", "dm": dm})
+
+    async def handle_get_dm_conversation(self, websocket, data):
+        if not self.require_auth(websocket):
+            await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+            return
+        username = self.clients[websocket]["username"]
+        other = data.get("username", "").strip()
+        if not other:
+            await self.send(websocket, {"type": "error", "message": "Username required"})
+            return
+        messages = await self.storage.get_dm_conversation(username, other)
+        await self.send(websocket, {"type": "dm_conversation", "username": other, "messages": messages})
+
+    async def handle_get_dm_contacts(self, websocket, data):
+        if not self.require_auth(websocket):
+            await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+            return
+        username = self.clients[websocket]["username"]
+        contacts = await self.storage.get_dm_contacts(username)
+        await self.send(websocket, {"type": "dm_contacts", "contacts": contacts})
+
+    async def handle_mark_dms_read(self, websocket, data):
+        if not self.require_auth(websocket):
+            await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+            return
+        recipient = self.clients[websocket]["username"]
+        sender = data.get("username", "").strip()
+        if sender:
+            await self.storage.mark_dms_read(recipient, sender)
+        unread = await self.storage.get_total_unread(recipient)
+        await self.send(websocket, {"type": "unread_dms", "count": unread})
+
+    async def handle_delete_post(self, websocket, data):
+        if not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Admin access required"})
+            return
+        post_id = data.get("post_id", "").strip()
+        if not post_id:
+            await self.send(websocket, {"type": "error", "message": "post_id required"})
+            return
+        if await self.storage.delete_post(post_id):
+            await self.send(websocket, {"type": "post_deleted", "post_id": post_id, "message": "Post deleted"})
+        else:
+            await self.send(websocket, {"type": "error", "message": "Post not found"})
+
+    async def handle_delete_topic(self, websocket, data):
+        if not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Admin access required"})
+            return
+        topic_id = data.get("topic_id", "").strip()
+        if not topic_id:
+            await self.send(websocket, {"type": "error", "message": "topic_id required"})
+            return
+        if await self.storage.delete_topic(topic_id):
+            await self.send(websocket, {"type": "topic_deleted", "topic_id": topic_id, "message": "Topic deleted"})
+        else:
+            await self.send(websocket, {"type": "error", "message": "Topic not found"})
+
+    async def handle_set_topic_admin_only(self, websocket, data):
+        if not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Admin access required"})
+            return
+        topic_id = data.get("topic_id", "").strip()
+        if not topic_id:
+            await self.send(websocket, {"type": "error", "message": "topic_id required"})
+            return
+        if await self.storage.set_topic_admin_only(topic_id, True):
+            await self.send(websocket, {"type": "topic_admin_only_set", "topic_id": topic_id, "message": "Topic set to admin only"})
+        else:
+            await self.send(websocket, {"type": "error", "message": "Topic not found"})
+
+    async def handle_remove_topic_admin_only(self, websocket, data):
+        if not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Admin access required"})
+            return
+        topic_id = data.get("topic_id", "").strip()
+        if not topic_id:
+            await self.send(websocket, {"type": "error", "message": "topic_id required"})
+            return
+        if await self.storage.set_topic_admin_only(topic_id, False):
+            await self.send(websocket, {"type": "topic_admin_only_removed", "topic_id": topic_id, "message": "Topic no longer admin only"})
+        else:
+            await self.send(websocket, {"type": "error", "message": "Topic not found"})
+
+    async def handle_reset_password(self, websocket, data):
+        if not self.require_admin(websocket):
+            await self.send(websocket, {"type": "error", "message": "Admin access required"})
+            return
+        username = data.get("username", "").strip()
+        new_password = data.get("new_password", "")
+        if not username or not new_password:
+            await self.send(websocket, {"type": "error", "message": "Username and new_password required"})
+            return
+        user = await self.storage.get_user(username)
+        if not user:
+            await self.send(websocket, {"type": "error", "message": "User not found"})
+            return
+        if len(new_password) < 4:
+            await self.send(websocket, {"type": "error", "message": "Password must be at least 4 characters"})
+            return
+        await self.storage.update_password(username, new_password)
+        await self.send(websocket, {"type": "password_reset", "username": username, "message": f"Password for {username} has been reset"})
 
     async def handler(self, websocket):
         try:

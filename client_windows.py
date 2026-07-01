@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "1.0.0"
+VERSION = "2.0.0"
 import json
 import threading
 import queue
@@ -32,6 +32,9 @@ class ChatwispFrame(wx.Frame):
         self.username = None
         self.is_admin = False
         self.is_super_admin = False
+        self.unread_count = 0
+        self.dm_contact = None
+        self.current_topic_data = None
         self.forum_id_stack = []
         self.topic_id_stack = []
         self.current_view = None
@@ -233,6 +236,7 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "topics_list":
             self.show_topics(data["forum_id"], data["topics"])
         elif dtype == "posts_list":
+            self.current_topic_data = data["topic"]
             self.show_posts(data["topic"], data["posts"])
         elif dtype == "topic_created":
             self.announce("Topic created")
@@ -279,6 +283,47 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "motd_set":
             self.announce(data.get("message", ""))
             wx.MessageBox(data.get("message", ""), "MOTD Updated", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "unread_dms":
+            self.unread_count = data.get("count", 0)
+            self.announce(f"You have {self.unread_count} unread message{'s' if self.unread_count != 1 else ''}" if self.unread_count > 0 else "No unread messages")
+        elif dtype == "dm_contacts":
+            wx.CallAfter(self.show_dm_contacts, data["contacts"])
+        elif dtype == "search_results":
+            wx.CallAfter(self.show_dm_search_results, data["users"])
+        elif dtype == "dm_conversation":
+            wx.CallAfter(self.show_dm_conversation, data["messages"])
+        elif dtype == "dm_sent":
+            self.announce("Message sent")
+            if self.dm_contact:
+                self._send({"type": "get_dm_conversation", "username": self.dm_contact})
+        elif dtype == "dm_received":
+            dm = data["dm"]
+            other = dm["recipient"] if dm["sender"] == self.username else dm["sender"]
+            if self.current_view == "dm_chat" and self.dm_contact == other:
+                self._send({"type": "get_dm_conversation", "username": other})
+                self._send({"type": "mark_dms_read", "username": other})
+            else:
+                self.unread_count += 1
+                self.announce(f"New message from {other}")
+        elif dtype == "post_deleted":
+            self.announce("Post deleted")
+            if self.topic_id_stack:
+                self._request_posts(self.topic_id_stack[-1])
+        elif dtype == "topic_deleted":
+            self.announce("Topic deleted")
+            if self.forum_id_stack:
+                self._request_topics(self.forum_id_stack[-1])
+        elif dtype == "topic_admin_only_set":
+            self.announce("Topic set to admin only")
+            if self.topic_id_stack:
+                self._request_posts(self.topic_id_stack[-1])
+        elif dtype == "topic_admin_only_removed":
+            self.announce("Topic no longer admin only")
+            if self.topic_id_stack:
+                self._request_posts(self.topic_id_stack[-1])
+        elif dtype == "password_reset":
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Password Reset", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -307,6 +352,7 @@ class ChatwispFrame(wx.Frame):
     # --- Main Menu (Forums) ---
 
     def show_main_menu(self):
+        self.current_topic_data = None
         self.announce("Loading forums...")
         self._request_forums()
 
@@ -320,9 +366,12 @@ class ChatwispFrame(wx.Frame):
         title.SetFont(f)
         sz.Add(title, 0, wx.ALL, 15)
 
+        msg_btn = wx.Button(pnl, label="Messages")
+        msg_btn.Bind(wx.EVT_BUTTON, lambda e: self._send({"type": "get_dm_contacts"}))
+        admin_sz = wx.BoxSizer(wx.HORIZONTAL)
+        admin_sz.Add(msg_btn, 0, wx.RIGHT, 5)
         if self.is_admin:
-            admin_sz = wx.BoxSizer(wx.HORIZONTAL)
-            admin_sz.Add(wx.StaticText(pnl, label="Admin Controls:  "), 0, wx.ALIGN_CENTER_VERTICAL)
+            admin_sz.Add(wx.StaticText(pnl, label="  Admin:  "), 0, wx.ALIGN_CENTER_VERTICAL)
             accts_btn = wx.Button(pnl, label="Accounts")
             accts_btn.Bind(wx.EVT_BUTTON, lambda e: self._request_users())
             admin_sz.Add(accts_btn, 0, wx.RIGHT, 5)
@@ -332,7 +381,7 @@ class ChatwispFrame(wx.Frame):
             set_motd_btn = wx.Button(pnl, label="Set MOTD")
             set_motd_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_set_motd_dialog())
             admin_sz.Add(set_motd_btn, 0, wx.LEFT, 5)
-            sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
+        sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
 
         list_label = wx.StaticText(pnl, label="Forums:")
         sz.Add(list_label, 0, wx.LEFT | wx.RIGHT, 15)
@@ -392,6 +441,9 @@ class ChatwispFrame(wx.Frame):
             reopen_btn = wx.Button(pnl, label="Reopen Topic")
             reopen_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_reopen_topic())
             admin_sz.Add(reopen_btn, 0, wx.LEFT, 5)
+            delete_topic_btn = wx.Button(pnl, label="Delete Topic")
+            delete_topic_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_delete_topic())
+            admin_sz.Add(delete_topic_btn, 0, wx.LEFT, 5)
             sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         sz.Add(wx.StaticText(pnl, label="Topics:"), 0, wx.LEFT | wx.RIGHT, 10)
@@ -451,14 +503,26 @@ class ChatwispFrame(wx.Frame):
             if topic["closed"]:
                 reopen_btn = wx.Button(pnl, label="Reopen Topic")
                 reopen_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_reopen_topic())
-                admin_sz.Add(reopen_btn, 0)
+                admin_sz.Add(reopen_btn, 0, wx.RIGHT, 5)
             else:
                 close_btn = wx.Button(pnl, label="Close Topic")
                 close_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_close_topic())
-                admin_sz.Add(close_btn, 0)
+                admin_sz.Add(close_btn, 0, wx.RIGHT, 5)
+            toggle_admin_only_btn = wx.Button(pnl, label="Remove Admin Only" if topic.get("admin_only") else "Make Admin Only")
+            toggle_admin_only_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_toggle_admin_only())
+            admin_sz.Add(toggle_admin_only_btn, 0, wx.RIGHT, 5)
+            delete_post_btn = wx.Button(pnl, label="Delete Selected Post")
+            delete_post_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_delete_post())
+            admin_sz.Add(delete_post_btn, 0, wx.RIGHT, 5)
+            delete_topic_btn = wx.Button(pnl, label="Delete Topic")
+            delete_topic_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_delete_topic())
+            admin_sz.Add(delete_topic_btn, 0, wx.RIGHT, 5)
             sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
-        title_text = f"Topic: {topic['title']}{' [CLOSED]' if topic['closed'] else ''}"
+        status_tags = ""
+        if topic["closed"]: status_tags += " [CLOSED]"
+        if topic.get("admin_only"): status_tags += " [ADMIN ONLY]"
+        title_text = f"Topic: {topic['title']}{status_tags}"
         sz.Add(wx.StaticText(pnl, label=title_text), 0, wx.LEFT | wx.RIGHT, 10)
         sz.AddSpacer(3)
 
@@ -472,7 +536,8 @@ class ChatwispFrame(wx.Frame):
             self.posts_list.Append(f"{p['author']} said: {p['content']}")
         sz.Add(self.posts_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
-        if not topic["closed"]:
+        can_reply = not topic["closed"] and not topic.get("admin_only")
+        if can_reply:
             sz.AddSpacer(5)
             reply_label = wx.StaticText(pnl, label="Your reply:")
             sz.Add(reply_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
@@ -481,10 +546,13 @@ class ChatwispFrame(wx.Frame):
             send_btn = wx.Button(pnl, label="Send Reply")
             send_btn.Bind(wx.EVT_BUTTON, self.on_send_reply)
             sz.Add(send_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 10)
+        elif topic.get("admin_only") and not self.is_admin:
+            msg = wx.StaticText(pnl, label="This topic is admin only. Only admins can post here.")
+            sz.Add(msg, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         pnl.SetSizer(sz)
         self.switch_view(pnl)
-        if not topic["closed"]:
+        if can_reply:
             self.reply_text.SetFocus()
         else:
             self.posts_list.SetFocus()
@@ -682,6 +750,11 @@ class ChatwispFrame(wx.Frame):
                 demote_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "demote_admin", user["username"]))
                 btn_sz.Add(demote_btn, 0, wx.RIGHT, 5)
 
+        if self.is_admin and user["username"] != self.username:
+            reset_pw_btn = wx.Button(dlg, label="Reset Password")
+            reset_pw_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_reset_password(dlg, user))
+            btn_sz.Add(reset_pw_btn, 0, wx.RIGHT, 5)
+
         close_btn = wx.Button(dlg, wx.ID_CLOSE, label="Close")
         btn_sz.Add(close_btn, 0)
 
@@ -739,6 +812,43 @@ class ChatwispFrame(wx.Frame):
             parent_dlg.EndModal(wx.ID_CLOSE)
             self.announce(f"Deleting {user['username']}...")
 
+    def _do_reset_password(self, parent_dlg, user):
+        dlg = wx.Dialog(self, title=f"Reset Password for {user['username']}", size=(400, 250))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        sz.Add(wx.StaticText(dlg, label="New Password:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        new_pw = wx.TextCtrl(dlg, style=wx.TE_PASSWORD)
+        sz.Add(new_pw, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
+
+        sz.Add(wx.StaticText(dlg, label="Confirm Password:"), 0, wx.LEFT | wx.RIGHT, 15)
+        confirm_pw = wx.TextCtrl(dlg, style=wx.TE_PASSWORD)
+        sz.Add(confirm_pw, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(15)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Reset Password")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+
+        dlg.SetSizer(sz)
+        new_pw.SetFocus()
+
+        if dlg.ShowModal() == wx.ID_OK:
+            p1 = new_pw.GetValue()
+            p2 = confirm_pw.GetValue()
+            if not p1 or len(p1) < 4:
+                wx.MessageBox("Password must be at least 4 characters", "Error", wx.OK | wx.ICON_ERROR)
+            elif p1 != p2:
+                wx.MessageBox("Passwords do not match", "Error", wx.OK | wx.ICON_ERROR)
+            else:
+                self._send({"type": "reset_password", "username": user["username"], "new_password": p1})
+                parent_dlg.EndModal(wx.ID_CLOSE)
+                self.announce(f"Resetting password for {user['username']}...")
+        dlg.Destroy()
+
     # --- Admin Topic Actions ---
 
     def _admin_close_topic(self):
@@ -758,6 +868,194 @@ class ChatwispFrame(wx.Frame):
         if tid:
             self._send({"type": "reopen_topic", "topic_id": tid})
             self.announce("Reopening topic...")
+
+    def _admin_delete_post(self):
+        if not self.is_admin:
+            self.announce("Admin access required")
+            return
+        idx = self.posts_list.GetSelection()
+        if idx < 0 or idx >= len(self.posts_data):
+            self.announce("Select a post first")
+            return
+        post = self.posts_data[idx]
+        if wx.MessageBox(f"Delete this post by {post['author']}? This cannot be undone.", "Confirm Delete", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+            self._send({"type": "delete_post", "post_id": post["id"]})
+            self.announce("Deleting post...")
+
+    def _admin_delete_topic(self):
+        if not self.is_admin:
+            self.announce("Admin access required")
+            return
+        tid = self.topic_id_stack[-1] if self.topic_id_stack else None
+        if tid:
+            if wx.MessageBox("Delete this entire topic and all its posts? This cannot be undone.", "Confirm Delete", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+                self._send({"type": "delete_topic", "topic_id": tid})
+                self.announce("Deleting topic...")
+
+    def _admin_toggle_admin_only(self):
+        if not self.is_admin or not self.topic_id_stack:
+            return
+        tid = self.topic_id_stack[-1]
+        if self.current_topic_data and self.current_topic_data.get("admin_only"):
+            self._send({"type": "remove_topic_admin_only", "topic_id": tid})
+            self.announce("Removing admin only...")
+        else:
+            self._send({"type": "set_topic_admin_only", "topic_id": tid})
+            self.announce("Setting admin only...")
+
+    # --- Private Messages ---
+
+    def show_dm_contacts(self, contacts):
+        self.current_view = "dm_list"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        home_btn = wx.Button(pnl, label="Home")
+        home_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        nav_sz.Add(home_btn, 0, wx.RIGHT, 5)
+        new_msg_btn = wx.Button(pnl, label="New Message")
+        new_msg_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_dm_search_dialog())
+        nav_sz.Add(new_msg_btn, 0)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
+
+        sz.Add(wx.StaticText(pnl, label="Conversations:"), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(3)
+
+        self.dm_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.dm_contacts_data = contacts
+        for c in contacts:
+            self.dm_list.Append(f"{c['username']}: {c['last_message']}")
+        self.dm_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_dm_contact_select)
+        sz.Add(self.dm_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if self.dm_list.GetCount() > 0:
+            self.dm_list.SetFocus()
+            self.dm_list.SetSelection(0)
+        self.announce(f"{len(contacts)} conversations.")
+
+    def on_dm_contact_select(self, event):
+        idx = self.dm_list.GetSelection()
+        if idx >= 0 and idx < len(self.dm_contacts_data):
+            self.dm_contact = self.dm_contacts_data[idx]["username"]
+            self.show_dm_chat()
+
+    def show_dm_search_dialog(self):
+        dlg = wx.Dialog(self, title="Search Users", size=(400, 400))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        sz.Add(wx.StaticText(dlg, label="Search for a user:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        search_input = wx.TextCtrl(dlg)
+        sz.Add(search_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
+
+        results_list = wx.ListBox(dlg, style=wx.LB_SINGLE, size=(-1, 200))
+        sz.Add(results_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(10)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        open_btn = wx.Button(dlg, label="Open Chat")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(open_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+
+        dlg.SetSizer(sz)
+        search_input.SetFocus()
+
+        def on_search(event=None):
+            q = search_input.GetValue().strip()
+            if q:
+                self._send({"type": "search_users", "query": q})
+                self.announce("Searching...")
+
+        search_input.Bind(wx.EVT_TEXT, on_search)
+
+        # Temporary handler for search results
+        original_recv = self.recv_queue.get
+
+        def on_open(event):
+            idx = results_list.GetSelection()
+            if idx >= 0:
+                username_str = results_list.GetString(idx).split(" (")[0]
+                self.dm_contact = username_str
+                dlg.EndModal(wx.ID_OK)
+
+        open_btn.Bind(wx.EVT_BUTTON, on_open)
+        results_list.Bind(wx.EVT_LISTBOX_DCLICK, on_open)
+
+        # Store results callback
+        self._dm_search_list = results_list
+
+        if dlg.ShowModal() == wx.ID_OK and self.dm_contact:
+            self.show_dm_chat()
+        dlg.Destroy()
+
+    def show_dm_search_results(self, users):
+        if hasattr(self, '_dm_search_list') and self._dm_search_list:
+            self._dm_search_list.Clear()
+            for u in users:
+                self._dm_search_list.Append(u)
+
+    def show_dm_chat(self):
+        if not self.dm_contact:
+            return
+        self.current_view = "dm_chat"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        back_btn = wx.Button(pnl, label="Back to Messages")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self._send({"type": "get_dm_contacts"}))
+        nav_sz.Add(back_btn, 0)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
+
+        title_text = f"Chat with {self.dm_contact}"
+        sz.Add(wx.StaticText(pnl, label=title_text), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(5)
+
+        self.dm_message_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.dm_messages_data = []
+        sz.Add(self.dm_message_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        sz.AddSpacer(5)
+        dm_input_label = wx.StaticText(pnl, label="Type a message:")
+        sz.Add(dm_input_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        self.dm_input = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        sz.Add(self.dm_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        send_dm_btn = wx.Button(pnl, label="Send")
+        send_dm_btn.Bind(wx.EVT_BUTTON, self.on_send_dm)
+        sz.Add(send_dm_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 10)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.dm_input.SetFocus()
+
+        self._send({"type": "get_dm_conversation", "username": self.dm_contact})
+        self._send({"type": "mark_dms_read", "username": self.dm_contact})
+        self.announce(f"Chat with {self.dm_contact}")
+
+    def show_dm_conversation(self, messages):
+        if not hasattr(self, 'dm_message_list'):
+            return
+        self.dm_messages_data = messages
+        self.dm_message_list.Clear()
+        for m in messages:
+            label = "You" if m["sender"] == self.username else m["sender"]
+            self.dm_message_list.Append(f"{label}: {m['content']}")
+        if messages:
+            self.dm_message_list.SetSelection(len(messages) - 1)
+        self.announce(f"{len(messages)} messages.")
+
+    def on_send_dm(self, event=None):
+        content = self.dm_input.GetValue().strip()
+        if not content or not self.dm_contact:
+            return
+        self._send({"type": "send_dm", "recipient": self.dm_contact, "content": content})
+        self.dm_input.SetValue("")
+        self.announce("Sending message...")
 
     # --- Navigation ---
 

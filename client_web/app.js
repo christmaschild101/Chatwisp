@@ -7,6 +7,9 @@ let currentTopicId = null;
 let forumsData = [];
 let topicsData = [];
 let currentTopicData = null;
+let dmContacts = [];
+let dmCurrentUser = null;
+let unreadCount = 0;
 
 function $(id) { return document.getElementById(id); }
 
@@ -18,7 +21,8 @@ function announce(msg) {
 function showView(viewId) {
   document.querySelectorAll('.view').forEach(v => v.hidden = true);
   $(viewId).hidden = false;
-  $(viewId).focus();
+  const el = $(viewId);
+  if (el) el.focus();
 }
 
 function hideAllSections() {
@@ -29,6 +33,7 @@ function hideAllSections() {
   $('post-section').hidden = true;
   $('admin-topic-close-btn').hidden = true;
   $('admin-topic-reopen-btn').hidden = true;
+  $('admin-topic-adminonly-btn').hidden = true;
 }
 
 function connect() {
@@ -64,6 +69,9 @@ function doConnect(wsUrl, user, pass, mode) {
     username = null;
     isAdmin = false;
     isSuperAdmin = false;
+    unreadCount = 0;
+    dmContacts = [];
+    dmCurrentUser = null;
     showView('view-login');
     hideAllSections();
     $('main-nav').hidden = true;
@@ -89,6 +97,9 @@ function handleServerMessage(data) {
     announce('Welcome, ' + username + '!');
   } else if (type === 'welcome') {
     alert(data.message);
+  } else if (type === 'unread_dms') {
+    unreadCount = data.count || 0;
+    updateMessagesBadge();
   } else if (type === 'login_error' || type === 'register_error') {
     $('login-error').textContent = data.message;
     $('login-error').hidden = false;
@@ -132,6 +143,28 @@ function handleServerMessage(data) {
     } else if (currentForumId) {
       sendMsg({ type: 'get_topics', forum_id: currentForumId });
     }
+  } else if (type === 'topic_admin_only_set') {
+    announce('Topic set to admin only');
+    if (currentTopicId === data.topic_id) {
+      sendMsg({ type: 'get_posts', topic_id: currentTopicId });
+    } else if (currentForumId) {
+      sendMsg({ type: 'get_topics', forum_id: currentForumId });
+    }
+  } else if (type === 'topic_admin_only_removed') {
+    announce('Topic no longer admin only');
+    if (currentTopicId === data.topic_id) {
+      sendMsg({ type: 'get_posts', topic_id: currentTopicId });
+    } else if (currentForumId) {
+      sendMsg({ type: 'get_topics', forum_id: currentForumId });
+    }
+  } else if (type === 'post_deleted') {
+    announce('Post deleted');
+    if (currentTopicId) {
+      sendMsg({ type: 'get_posts', topic_id: currentTopicId });
+    }
+  } else if (type === 'topic_deleted') {
+    announce('Topic deleted');
+    showMainMenu();
   } else if (type === 'users_list') {
     renderUsers(data.users);
   } else if (type === 'banned') {
@@ -156,9 +189,47 @@ function handleServerMessage(data) {
   } else if (type === 'motd_set') {
     announce(data.message || 'MOTD updated');
     alert(data.message || 'MOTD updated');
+  } else if (type === 'password_reset') {
+    announce(data.message || 'Password reset');
+    alert(data.message || 'Password reset');
+  } else if (type === 'search_results') {
+    renderDmSearchResults(data.users);
+  } else if (type === 'dm_sent') {
+    announce('Message sent');
+    if (dmCurrentUser) {
+      sendMsg({ type: 'get_dm_conversation', username: dmCurrentUser });
+    }
+  } else if (type === 'dm_received') {
+    const dm = data.dm;
+    if (dm.sender === username || dm.recipient === username) {
+      const other = dm.sender === username ? dm.recipient : dm.sender;
+      if (!$('view-dm-chat').hidden && dmCurrentUser === other) {
+        sendMsg({ type: 'get_dm_conversation', username: other });
+        sendMsg({ type: 'mark_dms_read', username: other });
+      } else {
+        unreadCount++;
+        updateMessagesBadge();
+        if ($('view-dm-list').hidden && $('view-dm-search').hidden) {
+          alert('New message from ' + other);
+        }
+      }
+    }
+  } else if (type === 'dm_conversation') {
+    renderDmConversation(data.messages);
+  } else if (type === 'dm_contacts') {
+    renderDmContacts(data.contacts);
   } else if (type === 'error') {
     announce('Error: ' + data.message);
     alert('Error: ' + data.message);
+  }
+}
+
+function updateMessagesBadge() {
+  const btn = $('messages-btn');
+  if (unreadCount > 0) {
+    btn.textContent = 'Messages (' + unreadCount + ')';
+  } else {
+    btn.textContent = 'Messages';
   }
 }
 
@@ -209,9 +280,12 @@ function showMainMenu() {
   $('section-title').textContent = 'Select Forum';
   $('top-controls').hidden = true;
   currentTopicData = null;
+  dmCurrentUser = null;
   announce('Loading forums...');
   sendMsg({ type: 'get_forums' });
 }
+
+// --- Forums ---
 
 function renderForums(forums) {
   const list = $('forum-list');
@@ -246,6 +320,8 @@ function selectForum(forumId) {
   sendMsg({ type: 'get_topics', forum_id: forumId });
 }
 
+// --- Topics ---
+
 function renderTopics(forumId, topics) {
   const list = $('topic-list');
   list.innerHTML = '';
@@ -255,8 +331,9 @@ function renderTopics(forumId, topics) {
     div.setAttribute('role', 'listitem');
     div.setAttribute('tabindex', '0');
     const statusStr = t.closed ? ' [CLOSED]' : '';
-    div.setAttribute('aria-label', 'Topic: ' + t.title + '. By ' + t.author + statusStr + '. ' + t.post_count + ' posts.');
-    div.innerHTML = '<div class="topic-title">' + escapeHtml(t.title) + statusStr + '</div><div class="topic-meta">By ' + escapeHtml(t.author) + ' - ' + t.post_count + ' posts</div>';
+    const adminStr = t.admin_only ? ' [ADMIN ONLY]' : '';
+    div.setAttribute('aria-label', 'Topic: ' + t.title + '. By ' + t.author + statusStr + adminStr + '. ' + t.post_count + ' posts.');
+    div.innerHTML = '<div class="topic-title">' + escapeHtml(t.title) + statusStr + adminStr + '</div><div class="topic-meta">By ' + escapeHtml(t.author) + ' - ' + t.post_count + ' posts</div>';
     div.addEventListener('click', function() { selectTopic(t.id); });
     div.addEventListener('keydown', function(e) {
       if (e.key === 'Enter') { selectTopic(t.id); }
@@ -279,10 +356,13 @@ function selectTopic(topicId) {
   sendMsg({ type: 'get_posts', topic_id: topicId });
 }
 
+// --- Posts ---
+
 function renderPosts(topic, posts) {
   const list = $('post-list');
   list.innerHTML = '';
-  $('post-section-title').textContent = 'Topic: ' + topic.title + (topic.closed ? ' [CLOSED]' : '');
+  const statusTags = (topic.closed ? ' [CLOSED]' : '') + (topic.admin_only ? ' [ADMIN ONLY]' : '');
+  $('post-section-title').textContent = 'Topic: ' + topic.title + statusTags;
 
   posts.forEach(function(p) {
     const div = document.createElement('div');
@@ -290,25 +370,64 @@ function renderPosts(topic, posts) {
     div.setAttribute('role', 'listitem');
     div.setAttribute('tabindex', '0');
     div.setAttribute('aria-label', p.author + ' said: ' + p.content);
-    div.innerHTML = '<div class="post-author">' + escapeHtml(p.author) + ' said:</div><div class="post-content">' + escapeHtml(p.content) + '</div>';
+    let html = '<div class="post-author">' + escapeHtml(p.author) + ' said:</div><div class="post-content">' + escapeHtml(p.content) + '</div>';
+    if (isAdmin) {
+      html += '<button class="post-delete-btn" data-post-id="' + p.id + '">Delete</button>';
+    }
+    div.innerHTML = html;
+    if (isAdmin) {
+      const delBtn = div.querySelector('.post-delete-btn');
+      delBtn.addEventListener('click', function(e) {
+        e.stopPropagation();
+        if (confirm('Delete this post? This cannot be undone.')) {
+          sendMsg({ type: 'delete_post', post_id: p.id });
+          announce('Deleting post...');
+        }
+      });
+    }
     list.appendChild(div);
   });
 
-  $('reply-area').hidden = topic.closed;
+  $('reply-area').hidden = topic.closed || topic.admin_only;
   $('topic-closed-msg').hidden = !topic.closed;
+  $('topic-adminonly-msg').hidden = !topic.admin_only;
 
   if (isAdmin) {
     $('admin-topic-close-btn').hidden = topic.closed;
     $('admin-topic-reopen-btn').hidden = !topic.closed;
+    $('admin-topic-adminonly-btn').hidden = false;
+    $('admin-topic-adminonly-btn').textContent = topic.admin_only ? 'Remove Admin Only' : 'Make Admin Only';
     $('top-controls').hidden = false;
   } else {
     $('admin-topic-close-btn').hidden = true;
     $('admin-topic-reopen-btn').hidden = true;
+    $('admin-topic-adminonly-btn').hidden = true;
   }
 
   announce(posts.length + ' posts loaded.');
   if (posts.length > 0) {
     list.firstChild.focus();
+  }
+}
+
+// --- Admin: Delete Topic, Admin Only Toggle ---
+
+function adminDeleteTopic() {
+  if (!isAdmin || !currentTopicId) return;
+  if (confirm('Delete this entire topic and all its posts? This cannot be undone.')) {
+    sendMsg({ type: 'delete_topic', topic_id: currentTopicId });
+    announce('Deleting topic...');
+  }
+}
+
+function adminToggleAdminOnly() {
+  if (!isAdmin || !currentTopicId || !currentTopicData) return;
+  if (currentTopicData.admin_only) {
+    sendMsg({ type: 'remove_topic_admin_only', topic_id: currentTopicId });
+    announce('Removing admin only...');
+  } else {
+    sendMsg({ type: 'set_topic_admin_only', topic_id: currentTopicId });
+    announce('Setting admin only...');
   }
 }
 
@@ -324,6 +443,8 @@ function showCreateTopic() {
   showView('view-create-topic');
   $('topic-title').value = '';
   $('topic-content').value = '';
+  $('topic-admin-only').checked = false;
+  $('topic-admin-only-group').hidden = !isAdmin;
   $('topic-title').focus();
   announce('Create new topic form');
 }
@@ -337,7 +458,8 @@ function submitCreateTopic() {
     return;
   }
   const fid = currentForumId;
-  sendMsg({ type: 'create_topic', forum_id: fid, title: title, content: content });
+  const admin_only = isAdmin && $('topic-admin-only').checked;
+  sendMsg({ type: 'create_topic', forum_id: fid, title: title, content: content, admin_only: admin_only });
   showView('view-main');
   hideAllSections();
   $('forum-section').hidden = false;
@@ -399,6 +521,8 @@ function adminReopenTopic() {
   announce('Reopening topic...');
 }
 
+// --- Accounts ---
+
 function showAccounts() {
   announce('Loading users...');
   sendMsg({ type: 'get_users' });
@@ -448,6 +572,9 @@ function userAction(user) {
       options += '5 - Demote from Admin\n';
     }
   }
+  if (isAdmin && user.username !== username) {
+    options += '6 - Reset Password\n';
+  }
   options += '\nEnter number:';
   const action = prompt(options);
   if (!action) return;
@@ -477,8 +604,145 @@ function userAction(user) {
       sendMsg({ type: 'demote_admin', username: user.username });
       announce('Demoting ' + user.username + '...');
     }
+  } else if (action === '6') {
+    const newPass = prompt('Enter new password for ' + user.username + ':');
+    if (newPass && newPass.length >= 4) {
+      const confirmPass = prompt('Confirm new password:');
+      if (confirmPass === newPass) {
+        if (confirm('Reset password for ' + user.username + '?')) {
+          sendMsg({ type: 'reset_password', username: user.username, new_password: newPass });
+          announce('Resetting password...');
+        }
+      } else {
+        alert('Passwords do not match');
+      }
+    } else if (newPass) {
+      alert('Password must be at least 4 characters');
+    }
   }
 }
+
+// --- Private Messages ---
+
+function showDmList() {
+  showView('view-dm-list');
+  announce('Loading conversations...');
+  sendMsg({ type: 'get_dm_contacts' });
+}
+
+function renderDmContacts(contacts) {
+  dmContacts = contacts;
+  const list = $('dm-contacts-list');
+  list.innerHTML = '';
+  if (contacts.length === 0) {
+    list.innerHTML = '<p>No conversations yet. Start a new message.</p>';
+    return;
+  }
+  contacts.forEach(function(c) {
+    const div = document.createElement('div');
+    div.className = 'forum-item';
+    div.setAttribute('role', 'listitem');
+    div.setAttribute('tabindex', '0');
+    div.setAttribute('aria-label', 'Chat with ' + c.username + '. Last message: ' + c.last_message);
+    div.innerHTML = '<div class="forum-name">' + escapeHtml(c.username) + '</div><div class="forum-desc">' + escapeHtml(c.last_message) + '</div>';
+    div.addEventListener('click', function() { selectDmContact(c.username); });
+    div.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { selectDmContact(c.username); }
+    });
+    list.appendChild(div);
+  });
+  announce(contacts.length + ' conversations.');
+  if (contacts.length > 0) {
+    list.firstChild.focus();
+  }
+}
+
+function showDmSearch() {
+  showView('view-dm-search');
+  $('dm-search-input').value = '';
+  $('dm-search-results').innerHTML = '';
+  $('dm-search-input').focus();
+  announce('Search for a user to message');
+}
+
+function searchUsers() {
+  const query = $('dm-search-input').value.trim();
+  if (query.length < 1) {
+    $('dm-search-results').innerHTML = '';
+    return;
+  }
+  sendMsg({ type: 'search_users', query: query });
+}
+
+function renderDmSearchResults(users) {
+  const list = $('dm-search-results');
+  list.innerHTML = '';
+  if (users.length === 0) {
+    list.innerHTML = '<p>No users found.</p>';
+    return;
+  }
+  users.forEach(function(u) {
+    const div = document.createElement('div');
+    div.className = 'forum-item';
+    div.setAttribute('role', 'listitem');
+    div.setAttribute('tabindex', '0');
+    div.setAttribute('aria-label', 'User: ' + u);
+    div.innerHTML = '<div class="forum-name">' + escapeHtml(u) + '</div>';
+    div.addEventListener('click', function() { selectDmContact(u); });
+    div.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { selectDmContact(u); }
+    });
+    list.appendChild(div);
+  });
+  announce(users.length + ' users found.');
+  if (users.length > 0) {
+    list.firstChild.focus();
+  }
+}
+
+function selectDmContact(other) {
+  dmCurrentUser = other;
+  showView('view-dm-chat');
+  $('dm-chat-title').textContent = 'Chat with ' + other;
+  $('dm-message-list').innerHTML = '<p>Loading messages...</p>';
+  $('dm-input').value = '';
+  $('dm-input').focus();
+  sendMsg({ type: 'get_dm_conversation', username: other });
+  sendMsg({ type: 'mark_dms_read', username: other });
+}
+
+function renderDmConversation(messages) {
+  const list = $('dm-message-list');
+  list.innerHTML = '';
+  if (messages.length === 0) {
+    list.innerHTML = '<p>No messages yet. Send a message to start the conversation.</p>';
+    $('dm-input').focus();
+    return;
+  }
+  messages.forEach(function(m) {
+    const div = document.createElement('div');
+    div.className = 'post-item';
+    div.setAttribute('role', 'listitem');
+    div.setAttribute('tabindex', '0');
+    const isMine = m.sender === username;
+    const label = isMine ? 'You' : m.sender;
+    div.setAttribute('aria-label', label + ' said: ' + m.content);
+    div.innerHTML = '<div class="post-author">' + (isMine ? 'You' : escapeHtml(m.sender)) + ' said:</div><div class="post-content">' + escapeHtml(m.content) + '</div>';
+    list.appendChild(div);
+  });
+  announce(messages.length + ' messages.');
+  list.lastChild ? list.lastChild.focus() : $('dm-input').focus();
+}
+
+function sendDm() {
+  const content = $('dm-input').value.trim();
+  if (!content || !dmCurrentUser) return;
+  sendMsg({ type: 'send_dm', recipient: dmCurrentUser, content: content });
+  $('dm-input').value = '';
+  announce('Sending message...');
+}
+
+// --- Utilities ---
 
 function escapeHtml(str) {
   const div = document.createElement('div');
@@ -495,7 +759,13 @@ document.addEventListener('keydown', function(e) {
     if (!$('view-login').hidden) {
       return;
     }
-    if (!$('view-accounts').hidden) {
+    if (!$('view-dm-chat').hidden) {
+      showDmList();
+    } else if (!$('view-dm-search').hidden) {
+      showDmList();
+    } else if (!$('view-dm-list').hidden) {
+      showMainMenu();
+    } else if (!$('view-accounts').hidden) {
       showMainMenu();
     } else if (!$('view-create-topic').hidden) {
       showMainMenu();

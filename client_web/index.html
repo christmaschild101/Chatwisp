@@ -12,6 +12,7 @@
     <h1 id="app-title">Chatwisp</h1>
     <nav id="main-nav" role="navigation" aria-label="Main navigation" hidden>
       <button id="home-btn" class="nav-btn" onclick="showMainMenu()">Home</button>
+      <button id="messages-btn" class="nav-btn" onclick="showDmList()">Messages</button>
     </nav>
   </header>
 
@@ -50,6 +51,7 @@
           <button id="new-topic-btn" onclick="showCreateTopic()">New Topic</button>
           <button id="admin-topic-close-btn" onclick="adminCloseTopic()" hidden>Close Topic</button>
           <button id="admin-topic-reopen-btn" onclick="adminReopenTopic()" hidden>Reopen Topic</button>
+          <button id="admin-topic-adminonly-btn" onclick="adminToggleAdminOnly()" hidden>Make Admin Only</button>
         </div>
       </section>
 
@@ -70,9 +72,37 @@
           <h3>Write a Reply</h3>
           <textarea id="reply-content" rows="3" aria-label="Your reply"></textarea>
           <button id="send-reply-btn" onclick="sendReply()">Send Reply</button>
-          <p id="topic-closed-msg" role="alert" class="info-text">This topic is closed. No new replies can be added.</p>
+          <p id="topic-closed-msg" role="alert" class="info-text" hidden>This topic is closed. No new replies can be added.</p>
+          <p id="topic-adminonly-msg" role="alert" class="info-text" hidden>This topic is admin only. Only admins can post here.</p>
         </div>
       </section>
+    </div>
+
+    <div id="view-dm-list" class="view" hidden aria-label="Messages">
+      <h2>Messages</h2>
+      <button onclick="showDmSearch()">New Message</button>
+      <div id="dm-contacts-list" role="list" aria-label="Conversations"></div>
+      <button onclick="showMainMenu()">Back to Main Menu</button>
+    </div>
+
+    <div id="view-dm-search" class="view" hidden aria-label="Search users">
+      <h2>Search Users</h2>
+      <div class="form-group">
+        <label for="dm-search-input">Username:</label>
+        <input type="text" id="dm-search-input" autocomplete="off" oninput="searchUsers()">
+      </div>
+      <div id="dm-search-results" role="list" aria-label="Search results"></div>
+      <button onclick="showDmList()">Back to Messages</button>
+    </div>
+
+    <div id="view-dm-chat" class="view" hidden aria-label="Chat">
+      <h2 id="dm-chat-title">Chat</h2>
+      <div id="dm-message-list" role="list" aria-label="Messages"></div>
+      <div id="dm-reply-area">
+        <textarea id="dm-input" rows="2" aria-label="Type a message" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendDm();}"></textarea>
+        <button id="dm-send-btn" onclick="sendDm()">Send</button>
+      </div>
+      <button onclick="showDmList()">Back to Messages</button>
     </div>
 
     <div id="view-accounts" class="view" hidden aria-label="Accounts management">
@@ -91,6 +121,12 @@
         <div class="form-group">
           <label for="topic-content">First Post (optional):</label>
           <textarea id="topic-content" rows="5"></textarea>
+        </div>
+        <div class="form-group" id="topic-admin-only-group" hidden>
+          <label>
+            <input type="checkbox" id="topic-admin-only" value="1">
+            Admin only (only admins can post)
+          </label>
         </div>
         <div class="btn-group">
           <button type="submit">Create Topic</button>

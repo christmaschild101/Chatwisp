@@ -224,6 +224,37 @@ textarea:focus {
   margin: 10px 0;
 }
 
+#dm-reply-area {
+  margin-top: 20px;
+  padding: 15px;
+  background: #f8f9fa;
+  border-radius: 6px;
+  border: 2px solid #dee2e6;
+}
+
+#dm-input {
+  margin: 10px 0;
+}
+
+#dm-message-list {
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.post-delete-btn {
+  margin-top: 8px;
+  padding: 4px 12px;
+  font-size: 14px;
+  background: #e74c3c;
+  border-color: #e74c3c;
+}
+
+.post-delete-btn:hover,
+.post-delete-btn:focus {
+  background: #c0392b;
+  border-color: #c0392b;
+}
+
 /* Accessibility skip link */
 .skip-link {
   position: absolute;
