@@ -388,7 +388,7 @@ function renderPosts(topic, posts) {
     list.appendChild(div);
   });
 
-  $('reply-area').hidden = topic.closed || topic.admin_only;
+  $('reply-area').hidden = topic.closed || (topic.admin_only && !isAdmin);
   $('topic-closed-msg').hidden = !topic.closed;
   $('topic-adminonly-msg').hidden = !topic.admin_only;
 

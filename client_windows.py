@@ -536,7 +536,7 @@ class ChatwispFrame(wx.Frame):
             self.posts_list.Append(f"{p['author']} said: {p['content']}")
         sz.Add(self.posts_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
-        can_reply = not topic["closed"] and not topic.get("admin_only")
+        can_reply = not topic["closed"] and (not topic.get("admin_only") or self.is_admin)
         if can_reply:
             sz.AddSpacer(5)
             reply_label = wx.StaticText(pnl, label="Your reply:")
