@@ -5,11 +5,14 @@ import json
 import hashlib
 import os
 import signal
+import time
 import uuid
 import sys
 from datetime import datetime
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
+
+SERVER_START_TIME = time.time()
 
 try:
     import websockets
@@ -656,6 +659,8 @@ class ChatServer:
             "set_topic_admin_only": self.handle_set_topic_admin_only,
             "remove_topic_admin_only": self.handle_remove_topic_admin_only,
             "reset_password": self.handle_reset_password,
+            "ping": self.handle_ping,
+            "server_info": self.handle_server_info,
         }
 
         handler = handlers.get(msg_type)
@@ -1134,6 +1139,18 @@ class ChatServer:
             return
         await self.storage.update_password(username, new_password)
         await self.send(websocket, {"type": "password_reset", "username": username, "message": f"Password for {username} has been reset"})
+
+    async def handle_ping(self, websocket, data):
+        if not self.require_auth(websocket):
+            return
+        client_time = data.get("client_time", 0)
+        await self.send(websocket, {"type": "pong", "client_time": client_time, "server_time": time.time()})
+
+    async def handle_server_info(self, websocket, data):
+        if not self.require_auth(websocket):
+            return
+        uptime = int(time.time() - SERVER_START_TIME)
+        await self.send(websocket, {"type": "server_info", "uptime": uptime})
 
     async def handler(self, websocket):
         try:

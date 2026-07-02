@@ -270,17 +270,57 @@ textarea:focus {
   top: 0;
 }
 
-@media (max-width: 600px) {
+@media (max-width: 768px) {
   body {
     padding: 5px;
+  }
+  #app {
+    min-height: 95vh;
+    border-radius: 4px;
+  }
+  header {
+    padding: 12px 15px;
+  }
+  header h1 {
+    font-size: 1.3em;
+  }
+  #main-nav {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+  .nav-btn {
+    flex: 1;
+    min-width: 0;
+    font-size: 15px;
+    padding: 10px 8px;
   }
   main {
     padding: 10px;
   }
   button {
     width: 100%;
+    padding: 14px 20px;
+    font-size: 17px;
   }
   .btn-group {
     flex-direction: column;
+    gap: 8px;
+  }
+  input[type="text"],
+  input[type="password"],
+  textarea {
+    font-size: 16px;
+    padding: 12px 10px;
+  }
+  .forum-item,
+  .topic-item,
+  .post-item,
+  .user-item {
+    padding: 14px 12px;
+    margin-bottom: 6px;
+  }
+  #dm-message-list {
+    max-height: 60vh;
   }
 }

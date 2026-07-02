@@ -18,6 +18,13 @@ function announce(msg) {
   status.textContent = msg;
 }
 
+let _isMobile = false;
+function updateIsMobile() {
+  _isMobile = window.innerWidth < 768;
+}
+updateIsMobile();
+window.addEventListener('resize', updateIsMobile);
+
 function showView(viewId) {
   document.querySelectorAll('.view').forEach(v => v.hidden = true);
   $(viewId).hidden = false;
@@ -303,7 +310,7 @@ function renderForums(forums) {
     });
     list.appendChild(div);
   });
-  announce(forums.length + ' forums loaded. Use arrow keys to navigate.');
+  announce(forums.length + ' forums loaded. ' + (_isMobile ? 'Tap a forum to select it.' : 'Use arrow keys to navigate.'));
   if (forums.length > 0) {
     list.firstChild.focus();
   }
@@ -651,7 +658,7 @@ function renderDmContacts(contacts) {
     });
     list.appendChild(div);
   });
-  announce(contacts.length + ' conversations.');
+  announce(contacts.length + ' conversations. ' + (_isMobile ? 'Tap a conversation to open it.' : 'Use arrow keys to navigate.'));
   if (contacts.length > 0) {
     list.firstChild.focus();
   }

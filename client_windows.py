@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 import json
 import threading
 import queue
 import sys
 import os
+import time
+import ctypes
 
 try:
     import websockets.sync.client
@@ -44,6 +46,9 @@ class ChatwispFrame(wx.Frame):
         self.running = True
 
         self.view_panel = None
+        self._tts_sapi = None
+        self._pending_ping_time = 0
+        self._pending_server_info = False
 
         self.recv_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_poll_recv, self.recv_timer)
@@ -67,6 +72,22 @@ class ChatwispFrame(wx.Frame):
 
     def announce(self, message):
         self.statusbar.SetStatusText(message)
+
+    def _tts_speak(self, text):
+        try:
+            nvda = ctypes.windll.nvdaControllerClient
+            nvda.nvdaController_speakText(text)
+            return
+        except:
+            pass
+        if self._tts_sapi is None:
+            try:
+                import win32com.client
+                self._tts_sapi = win32com.client.Dispatch("SAPI.SpVoice")
+            except:
+                self._tts_sapi = False
+        if self._tts_sapi:
+            self._tts_sapi.Speak(text)
 
     def switch_view(self, view_panel):
         self.main_sizer.Clear(delete_windows=False)
@@ -324,6 +345,29 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "password_reset":
             self.announce(data.get("message", ""))
             wx.MessageBox(data.get("message", ""), "Password Reset", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "pong":
+            if self._pending_ping_time:
+                rtt = int((time.time() - self._pending_ping_time) * 1000)
+                self._pending_ping_time = 0
+                msg = f"Ping complete. The ping took {rtt} milliseconds."
+                self.announce(msg)
+                self._tts_speak(msg)
+        elif dtype == "server_info":
+            if self._pending_server_info:
+                self._pending_server_info = False
+                uptime = data.get("uptime", 0)
+                days = uptime // 86400
+                hours = (uptime % 86400) // 3600
+                minutes = (uptime % 3600) // 60
+                seconds = uptime % 60
+                parts = []
+                if days: parts.append(f"{days} day{'s' if days != 1 else ''}")
+                if hours: parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+                if minutes: parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+                parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+                msg = f"Server has been up for " + ", ".join(parts)
+                self.announce(msg)
+                self._tts_speak(msg)
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -1097,6 +1141,16 @@ class ChatwispFrame(wx.Frame):
                 self.show_main_menu()
             else:
                 self.show_main_menu()
+            return
+        elif key == wx.WXK_F1:
+            self._tts_speak("Retrieving server info")
+            self._pending_server_info = True
+            self._send({"type": "server_info"})
+            return
+        elif key == wx.WXK_F2:
+            self._tts_speak("Pinging...")
+            self._pending_ping_time = time.time()
+            self._send({"type": "ping", "client_time": self._pending_ping_time})
             return
         event.Skip()
 
