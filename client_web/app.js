@@ -346,6 +346,27 @@ function renderTopics(forumId, topics) {
       if (e.key === 'Enter') { selectTopic(t.id); }
     });
     list.appendChild(div);
+    if (isAdmin) {
+      try {
+        var actions = [];
+        if (!t.closed) {
+          actions.push({ name: 'Close Topic', action: function() {
+            sendMsg({ type: 'close_topic', topic_id: t.id });
+            announce('Closing topic...');
+          }});
+        }
+        actions.push({ name: 'Delete Topic', action: function() {
+          if (confirm('Delete this entire topic and all its posts? This cannot be undone.')) {
+            sendMsg({ type: 'delete_topic', topic_id: t.id });
+            announce('Deleting topic...');
+          }
+        }});
+        div.accessibilityActions = actions;
+      } catch(e) {}
+      var actionLabels = 'Delete Topic';
+      if (!t.closed) actionLabels += ', Close Topic';
+      div.setAttribute('aria-actions', actionLabels);
+    }
   });
   announce(topics.length + ' topics loaded.');
   if (topics.length > 0) {
@@ -377,22 +398,49 @@ function renderPosts(topic, posts) {
     div.setAttribute('role', 'listitem');
     div.setAttribute('tabindex', '0');
     div.setAttribute('aria-label', p.author + ' said: ' + p.content);
-    let html = '<div class="post-author">' + escapeHtml(p.author) + ' said:</div><div class="post-content">' + escapeHtml(p.content) + '</div>';
+
+    const authorDiv = document.createElement('div');
+    authorDiv.className = 'post-author';
+    authorDiv.textContent = p.author + ' said:';
+    div.appendChild(authorDiv);
+
+    const contentDiv = document.createElement('div');
+    contentDiv.className = 'post-content';
+    contentDiv.textContent = p.content;
+    div.appendChild(contentDiv);
+
     if (isAdmin) {
-      html += '<button class="post-delete-btn" data-post-id="' + p.id + '">Delete</button>';
+      const delBtn = document.createElement('button');
+      delBtn.className = 'post-delete-btn';
+      delBtn.textContent = 'Delete';
+      delBtn.setAttribute('aria-label', 'Delete post by ' + p.author);
+      (function(postId) {
+        delBtn.addEventListener('click', function(e) {
+          e.stopPropagation();
+          if (confirm('Delete this post? This cannot be undone.')) {
+            sendMsg({ type: 'delete_post', post_id: postId });
+            announce('Deleting post...');
+          }
+        });
+      })(p.id);
+      div.appendChild(delBtn);
     }
-    div.innerHTML = html;
-    if (isAdmin) {
-      const delBtn = div.querySelector('.post-delete-btn');
-      delBtn.addEventListener('click', function(e) {
-        e.stopPropagation();
-        if (confirm('Delete this post? This cannot be undone.')) {
-          sendMsg({ type: 'delete_post', post_id: p.id });
-          announce('Deleting post...');
-        }
-      });
-    }
+
     list.appendChild(div);
+
+    if (isAdmin) {
+      try {
+        div.accessibilityActions = [
+          { name: 'Delete Post', action: function() {
+            if (confirm('Delete this post? This cannot be undone.')) {
+              sendMsg({ type: 'delete_post', post_id: p.id });
+              announce('Deleting post...');
+            }
+          }}
+        ];
+      } catch(e) {}
+      div.setAttribute('aria-actions', 'Delete Post');
+    }
   });
 
   $('reply-area').hidden = topic.closed || (topic.admin_only && !isAdmin);
@@ -404,11 +452,14 @@ function renderPosts(topic, posts) {
     $('admin-topic-reopen-btn').hidden = !topic.closed;
     $('admin-topic-adminonly-btn').hidden = false;
     $('admin-topic-adminonly-btn').textContent = topic.admin_only ? 'Remove Admin Only' : 'Make Admin Only';
+    $('admin-topic-delete-btn').hidden = false;
     $('top-controls').hidden = false;
   } else {
     $('admin-topic-close-btn').hidden = true;
     $('admin-topic-reopen-btn').hidden = true;
-    $('admin-topic-adminonly-btn').hidden = true;
+  $('admin-topic-adminonly-btn').hidden = true;
+  $('admin-topic-delete-btn').hidden = true;
+    $('admin-topic-delete-btn').hidden = true;
   }
 
   announce(posts.length + ' posts loaded.');

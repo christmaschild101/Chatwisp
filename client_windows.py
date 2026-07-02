@@ -74,12 +74,13 @@ class ChatwispFrame(wx.Frame):
         self.statusbar.SetStatusText(message)
 
     def _tts_speak(self, text):
-        try:
-            nvda = ctypes.windll.nvdaControllerClient
-            nvda.nvdaController_speakText(text)
-            return
-        except:
-            pass
+        for dll_name in ("nvdaControllerClient64", "nvdaControllerClient"):
+            try:
+                nvda = getattr(ctypes.windll, dll_name)
+                nvda.nvdaController_speakText(text)
+                return
+            except:
+                continue
         if self._tts_sapi is None:
             try:
                 import win32com.client
@@ -971,6 +972,7 @@ class ChatwispFrame(wx.Frame):
         for c in contacts:
             self.dm_list.Append(f"{c['username']}: {c['last_message']}")
         self.dm_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_dm_contact_select)
+        self.dm_list.Bind(wx.EVT_LISTBOX, self.on_dm_contact_select)
         sz.Add(self.dm_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         pnl.SetSizer(sz)
@@ -1127,6 +1129,9 @@ class ChatwispFrame(wx.Frame):
                 return
             if focused == getattr(self, 'users_list', None) and hasattr(self, 'users_list'):
                 self._do_user_select()
+                return
+            if focused == getattr(self, 'dm_list', None) and hasattr(self, 'dm_list'):
+                self.on_dm_contact_select(None)
                 return
         elif key == wx.WXK_ESCAPE:
             if self.current_view == "login":
