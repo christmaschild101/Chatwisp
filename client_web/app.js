@@ -60,7 +60,7 @@ function doConnect(wsUrl, user, pass, mode) {
 
   ws.onopen = function() {
     announce('Connected. Authenticating...');
-    ws.send(JSON.stringify({ type: mode, username: user, password: pass }));
+    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "2.1.0" }));
   };
 
   ws.onmessage = function(event) {
@@ -225,6 +225,18 @@ function handleServerMessage(data) {
     renderDmConversation(data.messages);
   } else if (type === 'dm_contacts') {
     renderDmContacts(data.contacts);
+  } else if (type === 'bot_dm_sent') {
+    announce('Message sent as official account');
+  } else if (type === 'bot_broadcast_complete') {
+    announce(data.message);
+    alert(data.message);
+  } else if (type === 'bot_post_created') {
+    announce('Post created as official account');
+  } else if (type === 'bot_topic_created') {
+    announce('Topic created as official account');
+    if (currentForumId) {
+      sendMsg({ type: 'get_topics', forum_id: currentForumId });
+    }
   } else if (type === 'error') {
     announce('Error: ' + data.message);
     alert('Error: ' + data.message);
@@ -599,11 +611,13 @@ function renderUsers(users) {
     if (u.is_admin) label += ', Admin';
     if (u.super_admin) label += ', Super Admin';
     if (u.banned) label += ', Banned' + (u.ban_reason ? ': ' + u.ban_reason : '');
+    if (u.ban_remaining) label += ', Remaining time: ' + u.ban_remaining;
     div.setAttribute('aria-label', label);
     let html = '<div class="user-name">' + escapeHtml(u.username) + '</div><div class="user-meta">';
     if (u.super_admin) html += '[Super Admin] ';
     else if (u.is_admin) html += '[Admin] ';
     if (u.banned) html += '[Banned' + (u.ban_reason ? ': ' + escapeHtml(u.ban_reason) : '') + ']';
+    if (u.ban_remaining) html += ' [Remaining: ' + escapeHtml(u.ban_remaining) + ']';
     html += '</div>';
     div.innerHTML = html;
     div.addEventListener('click', function() { userAction(u); });
@@ -638,10 +652,7 @@ function userAction(user) {
   if (!action) return;
   if (action === '1') {
     const reason = prompt('Ban reason (optional, leave blank for none):');
-    const duration = prompt('Duration (optional, leave blank for infinite):');
-    if (duration) {
-      alert('Ban duration feature is not implemented yet');
-    }
+    const duration = prompt('Duration (optional, leave blank for infinite, e.g. 1h30m, 2d):');
     sendMsg({ type: 'ban_user', username: user.username, reason: reason || null, duration: duration || null });
     announce('Banning ' + user.username + '...');
   } else if (action === '2' && user.banned) {
@@ -763,8 +774,15 @@ function selectDmContact(other) {
   showView('view-dm-chat');
   $('dm-chat-title').textContent = 'Chat with ' + other;
   $('dm-message-list').innerHTML = '<p>Loading messages...</p>';
-  $('dm-input').value = '';
-  $('dm-input').focus();
+  if (other === 'Chatwisp Official Account') {
+    $('dm-reply-area').hidden = true;
+    $('dm-bot-noreply').hidden = false;
+  } else {
+    $('dm-reply-area').hidden = false;
+    $('dm-bot-noreply').hidden = true;
+    $('dm-input').value = '';
+    $('dm-input').focus();
+  }
   sendMsg({ type: 'get_dm_conversation', username: other });
   sendMsg({ type: 'mark_dms_read', username: other });
 }
@@ -789,7 +807,11 @@ function renderDmConversation(messages) {
     list.appendChild(div);
   });
   announce(messages.length + ' messages.');
-  list.lastChild ? list.lastChild.focus() : $('dm-input').focus();
+  if (dmCurrentUser === 'Chatwisp Official Account') {
+    if (list.lastChild) list.lastChild.focus();
+  } else {
+    list.lastChild ? list.lastChild.focus() : $('dm-input').focus();
+  }
 }
 
 function sendDm() {
@@ -801,6 +823,66 @@ function sendDm() {
 }
 
 // --- Utilities ---
+
+function showBotControls() {
+  showView('view-bot-controls');
+  $('bot-dm-recipient').value = '';
+  $('bot-dm-content').value = '';
+  $('bot-broadcast-content').value = '';
+  $('bot-post-topic').value = '';
+  $('bot-post-content').value = '';
+  $('bot-topic-forum').value = '';
+  $('bot-topic-title').value = '';
+  $('bot-topic-content').value = '';
+  $('bot-dm-recipient').focus();
+  announce('Official account controls');
+}
+
+function botSendDm() {
+  const recipient = $('bot-dm-recipient').value.trim();
+  const content = $('bot-dm-content').value.trim();
+  if (!recipient || !content) {
+    alert('Recipient and content required');
+    return;
+  }
+  sendMsg({ type: 'bot_send_dm', recipient: recipient, content: content });
+  announce('Sending DM as official account...');
+}
+
+function botBroadcast() {
+  const content = $('bot-broadcast-content').value.trim();
+  if (!content) {
+    alert('Content required');
+    return;
+  }
+  if (confirm('Broadcast this message to ALL users? This cannot be undone.')) {
+    sendMsg({ type: 'bot_broadcast', content: content });
+    announce('Broadcasting...');
+  }
+}
+
+function botCreatePost() {
+  const topic_id = $('bot-post-topic').value.trim();
+  const content = $('bot-post-content').value.trim();
+  if (!topic_id || !content) {
+    alert('Topic ID and content required');
+    return;
+  }
+  sendMsg({ type: 'bot_create_post', topic_id: topic_id, content: content });
+  announce('Creating post as official account...');
+}
+
+function botCreateTopic() {
+  const forum_id = $('bot-topic-forum').value.trim();
+  const title = $('bot-topic-title').value.trim();
+  const content = $('bot-topic-content').value.trim();
+  if (!forum_id || !title) {
+    alert('Forum ID and title required');
+    return;
+  }
+  sendMsg({ type: 'bot_create_topic', forum_id: forum_id, title: title, content: content });
+  announce('Creating topic as official account...');
+}
 
 function escapeHtml(str) {
   const div = document.createElement('div');

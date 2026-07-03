@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chatwisp - Accessible Forum v2.0.1</title>
+<title>Chatwisp - Accessible Forum v2.1.0</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -43,6 +43,7 @@
           <button id="accounts-btn" onclick="showAccounts()">Manage Accounts</button>
           <button id="new-forum-btn" onclick="showCreateForum()">New Forum</button>
           <button id="set-motd-btn" onclick="showSetMotd()">Set MOTD</button>
+          <button id="bot-controls-btn" onclick="showBotControls()">Official Account</button>
         </div>
       </section>
 
@@ -99,6 +100,7 @@
     <div id="view-dm-chat" class="view" hidden aria-label="Chat">
       <h2 id="dm-chat-title">Chat</h2>
       <div id="dm-message-list" role="list" aria-label="Messages"></div>
+      <p id="dm-bot-noreply" class="info-text" hidden>This is the Chatwisp Official Account. You cannot reply to it.</p>
       <div id="dm-reply-area">
         <textarea id="dm-input" rows="2" aria-label="Type a message" onkeydown="if(event.key==='Enter'&&!event.shiftKey){event.preventDefault();sendDm();}"></textarea>
         <button id="dm-send-btn" onclick="sendDm()">Send</button>
@@ -152,6 +154,62 @@
           <button type="button" onclick="showMainMenu()">Cancel</button>
         </div>
       </form>
+    </div>
+
+    <div id="view-bot-controls" class="view" hidden aria-label="Official Account controls">
+      <h2>Official Account Controls</h2>
+      <section aria-label="Send DM as Official Account">
+        <h3>Send DM</h3>
+        <div class="form-group">
+          <label for="bot-dm-recipient">Recipient:</label>
+          <input type="text" id="bot-dm-recipient" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="bot-dm-content">Message:</label>
+          <textarea id="bot-dm-content" rows="3"></textarea>
+        </div>
+        <button onclick="botSendDm()">Send DM</button>
+      </section>
+      <hr>
+      <section aria-label="Broadcast to All Users">
+        <h3>Broadcast</h3>
+        <div class="form-group">
+          <label for="bot-broadcast-content">Message:</label>
+          <textarea id="bot-broadcast-content" rows="3"></textarea>
+        </div>
+        <button onclick="botBroadcast()">Broadcast</button>
+      </section>
+      <hr>
+      <section aria-label="Create Post as Official Account">
+        <h3>Create Post</h3>
+        <div class="form-group">
+          <label for="bot-post-topic">Topic ID:</label>
+          <input type="text" id="bot-post-topic" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="bot-post-content">Content:</label>
+          <textarea id="bot-post-content" rows="3"></textarea>
+        </div>
+        <button onclick="botCreatePost()">Create Post</button>
+      </section>
+      <hr>
+      <section aria-label="Create Topic as Official Account">
+        <h3>Create Topic</h3>
+        <div class="form-group">
+          <label for="bot-topic-forum">Forum ID:</label>
+          <input type="text" id="bot-topic-forum" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="bot-topic-title">Title:</label>
+          <input type="text" id="bot-topic-title" autocomplete="off">
+        </div>
+        <div class="form-group">
+          <label for="bot-topic-content">First Post (optional):</label>
+          <textarea id="bot-topic-content" rows="3"></textarea>
+        </div>
+        <button onclick="botCreateTopic()">Create Topic</button>
+      </section>
+      <button onclick="showMainMenu()">Back to Main Menu</button>
     </div>
   </main>
 

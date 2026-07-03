@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 import json
 import threading
 import queue
@@ -174,7 +174,7 @@ class ChatwispFrame(wx.Frame):
             with websockets.sync.client.connect(uri) as ws:
                 self.ws = ws
                 self.connected = True
-                ws.send(json.dumps({"type": mode, "username": username, "password": password}))
+                ws.send(json.dumps({"type": mode, "username": username, "password": password, "client_version": VERSION}))
                 response = json.loads(ws.recv())
                 if response.get("type") == "login_success":
                     self.username = response["username"]
@@ -369,6 +369,17 @@ class ChatwispFrame(wx.Frame):
                 msg = f"Server has been up for " + ", ".join(parts)
                 self.announce(msg)
                 self._tts_speak(msg)
+        elif dtype == "bot_dm_sent":
+            self.announce("Message sent as official account")
+        elif dtype == "bot_broadcast_complete":
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Broadcast Complete", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "bot_post_created":
+            self.announce("Post created as official account")
+        elif dtype == "bot_topic_created":
+            self.announce("Topic created as official account")
+            if self.forum_id_stack:
+                self._request_topics(self.forum_id_stack[-1])
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -426,6 +437,9 @@ class ChatwispFrame(wx.Frame):
             set_motd_btn = wx.Button(pnl, label="Set MOTD")
             set_motd_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_set_motd_dialog())
             admin_sz.Add(set_motd_btn, 0, wx.LEFT, 5)
+            bot_btn = wx.Button(pnl, label="Official Account")
+            bot_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_bot_controls())
+            admin_sz.Add(bot_btn, 0, wx.LEFT, 5)
         sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
 
         list_label = wx.StaticText(pnl, label="Forums:")
@@ -948,6 +962,123 @@ class ChatwispFrame(wx.Frame):
             self._send({"type": "set_topic_admin_only", "topic_id": tid})
             self.announce("Setting admin only...")
 
+    def show_bot_controls(self):
+        self.current_view = "bot_controls"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Official Account Controls")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 3); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.ALL, 15)
+
+        # Send DM
+        sz.Add(wx.StaticText(pnl, label="Send DM as Official Account:"), 0, wx.LEFT | wx.RIGHT, 10)
+        gs = wx.FlexGridSizer(2, 2, 5, 10)
+        gs.Add(wx.StaticText(pnl, label="Recipient:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_dm_recipient = wx.TextCtrl(pnl)
+        gs.Add(self.bot_dm_recipient, 0, wx.EXPAND)
+        gs.Add(wx.StaticText(pnl, label="Message:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_dm_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        gs.Add(self.bot_dm_content, 0, wx.EXPAND)
+        gs.AddGrowableCol(1)
+        sz.Add(gs, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        send_dm_btn = wx.Button(pnl, label="Send DM")
+        send_dm_btn.Bind(wx.EVT_BUTTON, self._on_bot_send_dm)
+        sz.Add(send_dm_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        # Broadcast
+        sz.Add(wx.StaticText(pnl, label="Broadcast to All Users:"), 0, wx.LEFT | wx.RIGHT, 10)
+        self.bot_broadcast_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        sz.Add(self.bot_broadcast_content, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        broadcast_btn = wx.Button(pnl, label="Broadcast")
+        broadcast_btn.Bind(wx.EVT_BUTTON, self._on_bot_broadcast)
+        sz.Add(broadcast_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        # Create Post
+        sz.Add(wx.StaticText(pnl, label="Create Post as Official Account:"), 0, wx.LEFT | wx.RIGHT, 10)
+        gs2 = wx.FlexGridSizer(2, 2, 5, 10)
+        gs2.Add(wx.StaticText(pnl, label="Topic ID:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_post_topic = wx.TextCtrl(pnl)
+        gs2.Add(self.bot_post_topic, 0, wx.EXPAND)
+        gs2.Add(wx.StaticText(pnl, label="Content:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_post_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        gs2.Add(self.bot_post_content, 0, wx.EXPAND)
+        gs2.AddGrowableCol(1)
+        sz.Add(gs2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        create_post_btn = wx.Button(pnl, label="Create Post")
+        create_post_btn.Bind(wx.EVT_BUTTON, self._on_bot_create_post)
+        sz.Add(create_post_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        # Create Topic
+        sz.Add(wx.StaticText(pnl, label="Create Topic as Official Account:"), 0, wx.LEFT | wx.RIGHT, 10)
+        gs3 = wx.FlexGridSizer(3, 2, 5, 10)
+        gs3.Add(wx.StaticText(pnl, label="Forum ID:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_topic_forum = wx.TextCtrl(pnl)
+        gs3.Add(self.bot_topic_forum, 0, wx.EXPAND)
+        gs3.Add(wx.StaticText(pnl, label="Title:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_topic_title = wx.TextCtrl(pnl)
+        gs3.Add(self.bot_topic_title, 0, wx.EXPAND)
+        gs3.Add(wx.StaticText(pnl, label="Content:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_topic_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        gs3.Add(self.bot_topic_content, 0, wx.EXPAND)
+        gs3.AddGrowableCol(1)
+        sz.Add(gs3, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        create_topic_btn = wx.Button(pnl, label="Create Topic")
+        create_topic_btn.Bind(wx.EVT_BUTTON, self._on_bot_create_topic)
+        sz.Add(create_topic_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        back_btn = wx.Button(pnl, label="Back to Main Menu")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        sz.Add(back_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.bot_dm_recipient.SetFocus()
+        self.announce("Official account controls")
+
+    def _on_bot_send_dm(self, event):
+        recipient = self.bot_dm_recipient.GetValue().strip()
+        content = self.bot_dm_content.GetValue().strip()
+        if not recipient or not content:
+            wx.MessageBox("Recipient and content required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "bot_send_dm", "recipient": recipient, "content": content})
+        self.announce("Sending DM as official account...")
+
+    def _on_bot_broadcast(self, event):
+        content = self.bot_broadcast_content.GetValue().strip()
+        if not content:
+            wx.MessageBox("Content required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        result = wx.MessageBox("Broadcast this message to ALL users? This cannot be undone.", "Confirm Broadcast", wx.YES_NO | wx.ICON_QUESTION)
+        if result == wx.YES:
+            self._send({"type": "bot_broadcast", "content": content})
+            self.announce("Broadcasting...")
+
+    def _on_bot_create_post(self, event):
+        topic_id = self.bot_post_topic.GetValue().strip()
+        content = self.bot_post_content.GetValue().strip()
+        if not topic_id or not content:
+            wx.MessageBox("Topic ID and content required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "bot_create_post", "topic_id": topic_id, "content": content})
+        self.announce("Creating post as official account...")
+
+    def _on_bot_create_topic(self, event):
+        forum_id = self.bot_topic_forum.GetValue().strip()
+        title = self.bot_topic_title.GetValue().strip()
+        content = self.bot_topic_content.GetValue().strip()
+        if not forum_id or not title:
+            wx.MessageBox("Forum ID and title required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "bot_create_topic", "forum_id": forum_id, "title": title, "content": content})
+        self.announce("Creating topic as official account...")
+
     # --- Private Messages ---
 
     def show_dm_contacts(self, contacts):
@@ -1067,17 +1198,24 @@ class ChatwispFrame(wx.Frame):
         sz.Add(self.dm_message_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         sz.AddSpacer(5)
-        dm_input_label = wx.StaticText(pnl, label="Type a message:")
-        sz.Add(dm_input_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
-        self.dm_input = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
-        sz.Add(self.dm_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        send_dm_btn = wx.Button(pnl, label="Send")
-        send_dm_btn.Bind(wx.EVT_BUTTON, self.on_send_dm)
-        sz.Add(send_dm_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 10)
+        if self.dm_contact == "Chatwisp Official Account":
+            bot_label = wx.StaticText(pnl, label="This is the Chatwisp Official Account. You cannot reply to it.")
+            f = bot_label.GetFont(); f = f.Italic()
+            bot_label.SetFont(f)
+            sz.Add(bot_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        else:
+            dm_input_label = wx.StaticText(pnl, label="Type a message:")
+            sz.Add(dm_input_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+            self.dm_input = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+            sz.Add(self.dm_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+            send_dm_btn = wx.Button(pnl, label="Send")
+            send_dm_btn.Bind(wx.EVT_BUTTON, self.on_send_dm)
+            sz.Add(send_dm_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 10)
 
         pnl.SetSizer(sz)
         self.switch_view(pnl)
-        self.dm_input.SetFocus()
+        if hasattr(self, 'dm_input') and self.dm_input:
+            self.dm_input.SetFocus()
 
         self._send({"type": "get_dm_conversation", "username": self.dm_contact})
         self._send({"type": "mark_dms_read", "username": self.dm_contact})

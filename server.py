@@ -8,11 +8,14 @@ import signal
 import time
 import uuid
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 
-VERSION = "2.0.1"
+VERSION = "2.1.0"
 
 SERVER_START_TIME = time.time()
+BOT_USERNAME = "Chatwisp Official Account"
+MINIMUM_CLIENT_VERSION = "2.0.0"
+DOWNLOAD_URL = "https://chatwisp.onrender.com/"
 
 try:
     import websockets
@@ -190,8 +193,18 @@ class Database:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMPTZ")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
             await conn.execute("INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
+
+            bot = await conn.fetchrow("SELECT username FROM users WHERE username = $1", BOT_USERNAME)
+            if not bot:
+                random_hash = hashlib.sha256((str(uuid.uuid4()) * 8).encode()).hexdigest()
+                await conn.execute(
+                    "INSERT INTO users (username, password_hash, is_admin, super_admin, banned, is_bot) VALUES ($1, $2, TRUE, FALSE, FALSE, TRUE)",
+                    BOT_USERNAME, random_hash
+                )
         print("Database schema initialized")
 
     async def _seed_from_json(self):
@@ -263,6 +276,24 @@ class Database:
     def _hash(password):
         return hashlib.sha256(password.encode()).hexdigest()
 
+    @staticmethod
+    def _parse_duration(text):
+        if not text:
+            return None
+        text = text.strip().lower()
+        total = 0
+        import re
+        parts = re.findall(r'(\d+)\s*(d|day|days|h|hr|hour|hours|m|min|minute|minutes)', text)
+        for num, unit in parts:
+            n = int(num)
+            if unit.startswith('d'):
+                total += n * 86400
+            elif unit.startswith('h'):
+                total += n * 3600
+            elif unit.startswith('m'):
+                total += n * 60
+        return total if total > 0 else None
+
     async def get_user(self, username):
         async with self.pool.acquire() as conn:
             row = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
@@ -275,6 +306,8 @@ class Database:
                     "banned": row["banned"],
                     "ban_reason": row["ban_reason"],
                     "ban_duration": row["ban_duration"],
+                    "ban_until": row["ban_until"],
+                    "is_bot": row["is_bot"],
                     "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 }
             return None
@@ -432,7 +465,7 @@ class Database:
     async def get_all_users(self):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT username, is_admin, super_admin, banned, ban_reason FROM users ORDER BY username ASC"
+                "SELECT username, is_admin, super_admin, banned, ban_reason FROM users WHERE is_bot = FALSE ORDER BY username ASC"
             )
             return [{
                 "username": row["username"],
@@ -442,18 +475,23 @@ class Database:
                 "ban_reason": row["ban_reason"],
             } for row in rows]
 
-    async def ban_user(self, username, reason=None, duration=None):
+    async def get_all_usernames(self):
+        async with self.pool.acquire() as conn:
+            rows = await conn.fetch("SELECT username FROM users WHERE is_bot = FALSE")
+            return [r["username"] for r in rows]
+
+    async def ban_user(self, username, reason=None, duration=None, ban_until=None):
         async with self.pool.acquire() as conn:
             result = await conn.execute(
-                "UPDATE users SET banned = TRUE, ban_reason = $2, ban_duration = $3 WHERE username = $1",
-                username, reason, duration
+                "UPDATE users SET banned = TRUE, ban_reason = $2, ban_duration = $3, ban_until = $4 WHERE username = $1",
+                username, reason, duration, ban_until
             )
             return result != "UPDATE 0"
 
     async def unban_user(self, username):
         async with self.pool.acquire() as conn:
             result = await conn.execute(
-                "UPDATE users SET banned = FALSE, ban_reason = NULL, ban_duration = NULL WHERE username = $1",
+                "UPDATE users SET banned = FALSE, ban_reason = NULL, ban_duration = NULL, ban_until = NULL WHERE username = $1",
                 username
             )
             return result != "UPDATE 0"
@@ -496,7 +534,7 @@ class Database:
     async def search_users(self, query):
         async with self.pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT username FROM users WHERE username ILIKE $1 ORDER BY username ASC LIMIT 20",
+                "SELECT username FROM users WHERE username ILIKE $1 AND is_bot = FALSE ORDER BY username ASC LIMIT 20",
                 f"%{query}%"
             )
             return [row["username"] for row in rows]
@@ -661,6 +699,10 @@ class ChatServer:
             "reset_password": self.handle_reset_password,
             "ping": self.handle_ping,
             "server_info": self.handle_server_info,
+            "bot_send_dm": self.handle_bot_send_dm,
+            "bot_broadcast": self.handle_bot_broadcast,
+            "bot_create_post": self.handle_bot_create_post,
+            "bot_create_topic": self.handle_bot_create_topic,
         }
 
         handler = handlers.get(msg_type)
@@ -672,17 +714,46 @@ class ChatServer:
     async def handle_login(self, websocket, data):
         username = data.get("username", "").strip()
         password = data.get("password", "")
+        client_version = data.get("client_version", "")
         if not username or not password:
             await self.send(websocket, {"type": "login_error", "message": "Username and password required"})
             return
+        if client_version:
+            try:
+                cv = tuple(int(x) for x in client_version.split("."))
+                sv = tuple(int(x) for x in VERSION.split("."))
+                if cv[0] != sv[0] or client_version < MINIMUM_CLIENT_VERSION:
+                    await self.send(websocket, {"type": "login_error", "message": f"Your client is out of date. Please download the latest version from {DOWNLOAD_URL}"})
+                    return
+            except (ValueError, IndexError):
+                pass
         user = await self.storage.get_user(username)
         if not user:
             await self.send(websocket, {"type": "login_error", "message": "Invalid username or password"})
             return
-        if user.get("banned"):
-            reason = user.get("ban_reason") or "No reason given"
-            await self.send(websocket, {"type": "login_error", "message": f"You are banned. Reason: {reason}"})
+        if user.get("is_bot"):
+            await self.send(websocket, {"type": "login_error", "message": "The Chatwisp Official Account cannot be logged into."})
             return
+        now = datetime.utcnow()
+        if user.get("banned"):
+            ban_until = user.get("ban_until")
+            reason = user.get("ban_reason") or "No reason given"
+            if ban_until and ban_until < now:
+                await self.storage.unban_user(username)
+            elif ban_until:
+                remaining = ban_until - now
+                days = remaining.days
+                hours = remaining.seconds // 3600
+                mins = (remaining.seconds % 3600) // 60
+                parts = []
+                if days: parts.append(f"{days}d")
+                parts.append(f"{hours}h {mins}m")
+                time_str = " ".join(parts)
+                await self.send(websocket, {"type": "login_error", "message": f"You are banned. Remaining time: {time_str}. Reason: {reason}"})
+                return
+            else:
+                await self.send(websocket, {"type": "login_error", "message": f"You are banned. Reason: {reason}"})
+                return
         if not await self.storage.verify_password(username, password):
             await self.send(websocket, {"type": "login_error", "message": "Invalid username or password"})
             return
@@ -712,9 +783,19 @@ class ChatServer:
     async def handle_register(self, websocket, data):
         username = data.get("username", "").strip()
         password = data.get("password", "")
+        client_version = data.get("client_version", "")
         if not username or not password:
             await self.send(websocket, {"type": "register_error", "message": "Username and password required"})
             return
+        if client_version:
+            try:
+                cv = tuple(int(x) for x in client_version.split("."))
+                sv = tuple(int(x) for x in VERSION.split("."))
+                if cv[0] != sv[0] or client_version < MINIMUM_CLIENT_VERSION:
+                    await self.send(websocket, {"type": "register_error", "message": f"Your client is out of date. Please download the latest version from {DOWNLOAD_URL}"})
+                    return
+            except (ValueError, IndexError):
+                pass
         if len(username) < 3:
             await self.send(websocket, {"type": "register_error", "message": "Username must be at least 3 characters"})
             return
@@ -726,6 +807,16 @@ class ChatServer:
             return
         await self.storage.create_user(username, password, is_admin=False)
         await self.send(websocket, {"type": "register_success"})
+        welcome = ("Welcome to Chatwisp!\n\n"
+                   "Chatwisp is a community forum where you can:\n"
+                   "- Browse and post in topic-based forums\n"
+                   "- Send private messages to other users\n"
+                   "- Customize your experience\n\n"
+                   "To get started, select a forum from the main menu and join the conversation!")
+        await self.storage.send_dm(BOT_USERNAME, username, welcome)
+        for ws, info in list(self.clients.items()):
+            if info["username"] == username:
+                await self.send(ws, {"type": "dm_received", "dm": {"sender": BOT_USERNAME, "content": welcome}})
 
     async def handle_get_forums(self, websocket, data):
         if not self.require_auth(websocket):
@@ -868,12 +959,17 @@ class ChatServer:
         if username == self.clients[websocket]["username"]:
             await self.send(websocket, {"type": "error", "message": "Cannot ban yourself"})
             return
+        if username == BOT_USERNAME:
+            await self.send(websocket, {"type": "error", "message": "Cannot ban the official account"})
+            return
         reason = data.get("reason")
         duration = data.get("duration")
+        ban_until = None
         if duration:
-            await self.send(websocket, {"type": "error", "message": "Ban duration feature is not implemented yet"})
-            return
-        if await self.storage.ban_user(username, reason, duration):
+            seconds = Database._parse_duration(duration)
+            if seconds:
+                ban_until = datetime.utcnow() + timedelta(seconds=seconds)
+        if await self.storage.ban_user(username, reason, duration, ban_until):
             await self.send(websocket, {"type": "banned", "username": username, "message": f"User {username} has been banned"})
             for ws, info in list(self.clients.items()):
                 if info["username"] == username:
@@ -1031,6 +1127,9 @@ class ChatServer:
         if not user:
             await self.send(websocket, {"type": "error", "message": "User not found"})
             return
+        if user.get("is_bot"):
+            await self.send(websocket, {"type": "error", "message": "The Chatwisp Official Account cannot receive messages."})
+            return
         dm = await self.storage.send_dm(sender, recipient, content)
         await self.send(websocket, {"type": "dm_sent", "dm": dm})
         # Forward to recipient if online
@@ -1139,6 +1238,63 @@ class ChatServer:
             return
         await self.storage.update_password(username, new_password)
         await self.send(websocket, {"type": "password_reset", "username": username, "message": f"Password for {username} has been reset"})
+
+    async def handle_bot_send_dm(self, websocket, data):
+        if not self.require_admin(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Admin access required"})
+        recipient = data.get("recipient", "").strip()
+        content = data.get("content", "").strip()
+        if not recipient or not content:
+            return await self.send(websocket, {"type": "error", "message": "Recipient and content required"})
+        user = await self.storage.get_user(recipient)
+        if not user:
+            return await self.send(websocket, {"type": "error", "message": "User not found"})
+        if user.get("is_bot"):
+            return await self.send(websocket, {"type": "error", "message": "Cannot send DMs to the bot through this command"})
+        dm = await self.storage.send_dm(BOT_USERNAME, recipient, content)
+        await self.send(websocket, {"type": "bot_dm_sent", "dm": dm})
+        for ws, info in list(self.clients.items()):
+            if info["username"] == recipient:
+                await self.send(ws, {"type": "dm_received", "dm": dm})
+
+    async def handle_bot_broadcast(self, websocket, data):
+        if not self.require_admin(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Admin access required"})
+        content = data.get("content", "").strip()
+        if not content:
+            return await self.send(websocket, {"type": "error", "message": "Content required"})
+        all_users = await self.storage.get_all_usernames()
+        sent_count = 0
+        for recipient in all_users:
+            dm = await self.storage.send_dm(BOT_USERNAME, recipient, content)
+            sent_count += 1
+            for ws, info in list(self.clients.items()):
+                if info["username"] == recipient:
+                    await self.send(ws, {"type": "dm_received", "dm": dm})
+        await self.send(websocket, {"type": "bot_broadcast_complete", "message": f"Broadcast sent to {sent_count} users."})
+
+    async def handle_bot_create_post(self, websocket, data):
+        if not self.require_admin(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Admin access required"})
+        topic_id = data.get("topic_id", "").strip()
+        content = data.get("content", "").strip()
+        if not topic_id or not content:
+            return await self.send(websocket, {"type": "error", "message": "topic_id and content required"})
+        post = await self.storage.create_post(topic_id, BOT_USERNAME, content)
+        await self.send(websocket, {"type": "bot_post_created", "post": post})
+
+    async def handle_bot_create_topic(self, websocket, data):
+        if not self.require_admin(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Admin access required"})
+        forum_id = data.get("forum_id", "").strip()
+        title = data.get("title", "").strip()
+        content = data.get("content", "").strip()
+        if not forum_id or not title:
+            return await self.send(websocket, {"type": "error", "message": "forum_id and title required"})
+        topic = await self.storage.create_topic(forum_id, title, BOT_USERNAME)
+        if content:
+            await self.storage.create_post(topic["id"], BOT_USERNAME, content)
+        await self.send(websocket, {"type": "bot_topic_created", "topic": topic})
 
     async def handle_ping(self, websocket, data):
         if not self.require_auth(websocket):
