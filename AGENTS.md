@@ -50,6 +50,28 @@ Both hardcode `wss://chatwisp.onrender.com`.
 - **Web client**: navigate to `https://chatwisp.onrender.com/` in any browser (server serves the static files from `client_web/`). Can also open `client_web/index.html` locally but same-origin fetching works better.
 - **Windows client**: `pip install wxPython && python client_windows.py`.
 
+## Building the Windows Installer
+
+Requires Windows with [Inno Setup](https://jrsoftware.org/isdl.php) and Python + PyInstaller.
+
+```bash
+# Step 1: Build the executable
+pyinstaller --onefile --windowed --name Chatwisp.exe client_windows.py
+
+# Step 2: Copy the exe to the project root
+copy dist\Chatwisp.exe .
+
+# Step 3: Open setup.iss in Inno Setup Compiler and click Compile
+# Or from command line:
+ISCC.exe setup.iss
+```
+
+This produces `installer\ChatwispSetup-3.0.0.exe`. The installer:
+- Installs Chatwisp.exe to `Program Files\Chatwisp`
+- Registers the `chatwisp://` URI protocol (admin rights required — handled by the installer)
+- Creates Start Menu and optional desktop shortcut
+- Provides an uninstaller
+
 ## Admin account
 
 Only the first `create_dev_account` WebSocket message succeeds (no prior admin exists). After that, send `{"type": "create_dev_account", "username": "...", "password": "..."}`.

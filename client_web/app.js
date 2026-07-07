@@ -10,6 +10,9 @@ let currentTopicData = null;
 let dmContacts = [];
 let dmCurrentUser = null;
 let unreadCount = 0;
+let pendingLink = null;
+let currentTopicSlug = null;
+let pendingLinkTopicId = null;
 
 function $(id) { return document.getElementById(id); }
 
@@ -60,7 +63,7 @@ function doConnect(wsUrl, user, pass, mode) {
 
   ws.onopen = function() {
     announce('Connected. Authenticating...');
-    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "2.1.0" }));
+    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "3.0.0" }));
   };
 
   ws.onmessage = function(event) {
@@ -237,6 +240,20 @@ function handleServerMessage(data) {
     if (currentForumId) {
       sendMsg({ type: 'get_topics', forum_id: currentForumId });
     }
+  } else if (type === 'signature_data') {
+    $('sig-input').value = data.signature || '';
+    updateSigCounter();
+  } else if (type === 'signature_updated') {
+    announce('Signature saved');
+    alert(data.message || 'Signature updated');
+  } else if (type === 'topic_link_resolved') {
+    const forumId = data.forum_id;
+    const topicId = data.topic_id;
+    currentForumId = forumId;
+    pendingLink = null;
+    sendMsg({ type: 'get_topics', forum_id: forumId });
+    currentTopicId = topicId;
+    pendingLinkTopicId = topicId;
   } else if (type === 'error') {
     announce('Error: ' + data.message);
     alert('Error: ' + data.message);
@@ -381,6 +398,12 @@ function renderTopics(forumId, topics) {
     }
   });
   announce(topics.length + ' topics loaded.');
+  if (pendingLinkTopicId) {
+    const tid = pendingLinkTopicId;
+    pendingLinkTopicId = null;
+    selectTopic(tid);
+    return;
+  }
   if (topics.length > 0) {
     list.firstChild.focus();
   }
@@ -401,6 +424,7 @@ function selectTopic(topicId) {
 function renderPosts(topic, posts) {
   const list = $('post-list');
   list.innerHTML = '';
+  currentTopicSlug = topic.slug || null;
   const statusTags = (topic.closed ? ' [CLOSED]' : '') + (topic.admin_only ? ' [ADMIN ONLY]' : '');
   $('post-section-title').textContent = 'Topic: ' + topic.title + statusTags;
 
@@ -409,7 +433,7 @@ function renderPosts(topic, posts) {
     div.className = 'post-item';
     div.setAttribute('role', 'listitem');
     div.setAttribute('tabindex', '0');
-    div.setAttribute('aria-label', p.author + ' said: ' + p.content);
+    div.setAttribute('aria-label', p.author + ' said: ' + p.content + (p.signature ? ' — ' + p.signature : ''));
 
     const authorDiv = document.createElement('div');
     authorDiv.className = 'post-author';
@@ -418,7 +442,11 @@ function renderPosts(topic, posts) {
 
     const contentDiv = document.createElement('div');
     contentDiv.className = 'post-content';
-    contentDiv.textContent = p.content;
+    let contentText = p.content;
+    if (p.signature) {
+      contentText += '\n— ' + p.signature;
+    }
+    contentDiv.textContent = contentText;
     div.appendChild(contentDiv);
 
     if (isAdmin) {
@@ -589,6 +617,23 @@ function adminReopenTopic() {
   if (!currentTopicId) return;
   sendMsg({ type: 'reopen_topic', topic_id: currentTopicId });
   announce('Reopening topic...');
+}
+
+function copyTopicLink() {
+  if (!currentForumId || !currentTopicSlug) {
+    announce('No topic link available');
+    return;
+  }
+  const url = 'https://chatwisp.onrender.com/forums/' + currentForumId + '/' + currentTopicSlug;
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(url).then(function() {
+      announce('Topic link copied to clipboard');
+    }).catch(function() {
+      prompt('Copy this link:', url);
+    });
+  } else {
+    prompt('Copy this link:', url);
+  }
 }
 
 // --- Accounts ---
@@ -884,6 +929,41 @@ function botCreateTopic() {
   announce('Creating topic as official account...');
 }
 
+function showSettings() {
+  showView('view-settings');
+  sendMsg({ type: 'get_signature' });
+  $('sig-input').focus();
+  updateSigCounter();
+  announce('Settings');
+}
+
+function updateSigCounter() {
+  const len = $('sig-input').value.length;
+  $('sig-counter').textContent = len + '/50';
+}
+
+function saveSignature() {
+  const sig = $('sig-input').value.trim();
+  if (sig.length > 50) {
+    alert('Signature must be 50 characters or less');
+    return;
+  }
+  sendMsg({ type: 'set_signature', signature: sig });
+  announce('Saving signature...');
+}
+
+function continueInBrowser() {
+  $('topic-link-choice').hidden = true;
+  $('login-username').focus();
+  announce('Please log in to continue to the topic');
+}
+
+function continueInWindowsClient() {
+  if (pendingLink) {
+    window.location.href = 'chatwisp://forums/' + pendingLink.forum_id + '/' + pendingLink.slug;
+  }
+}
+
 function escapeHtml(str) {
   const div = document.createElement('div');
   div.textContent = str;
@@ -891,6 +971,13 @@ function escapeHtml(str) {
 }
 
 document.addEventListener('DOMContentLoaded', function() {
+  const match = window.location.pathname.match(/^\/forums\/([^/]+)\/([^/]+)$/);
+  if (match) {
+    pendingLink = { forum_id: match[1], slug: match[2] };
+    $('topic-link-choice').hidden = false;
+    $('choice-browser-btn').focus();
+    announce('Topic link detected. Choose where to open it.');
+  }
   $('login-username').focus();
 });
 

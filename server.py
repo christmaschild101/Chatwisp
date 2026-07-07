@@ -4,13 +4,14 @@ import http
 import json
 import hashlib
 import os
+import secrets
 import signal
 import time
 import uuid
 import sys
 from datetime import datetime, timedelta
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 
 SERVER_START_TIME = time.time()
 BOT_USERNAME = "Chatwisp Official Account"
@@ -193,8 +194,10 @@ class Database:
             await conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS slug TEXT")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMPTZ")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT ''")
             await conn.execute("UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
             await conn.execute("INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
 
@@ -308,6 +311,7 @@ class Database:
                     "ban_duration": row["ban_duration"],
                     "ban_until": row["ban_until"],
                     "is_bot": row["is_bot"],
+                    "signature": row["signature"] or "",
                     "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 }
             return None
@@ -322,6 +326,13 @@ class Database:
             return True
         except asyncpg.exceptions.UniqueViolationError:
             return False
+
+    async def set_signature(self, username, signature):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET signature = $1 WHERE username = $2",
+                signature, username
+            )
 
     async def verify_password(self, username, password):
         user = await self.get_user(username)
@@ -383,6 +394,7 @@ class Database:
                 "author": row["author"],
                 "closed": row["closed"],
                 "admin_only": row["admin_only"],
+                "slug": row["slug"],
                 "post_count": row["post_count"],
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             } for row in rows]
@@ -398,16 +410,34 @@ class Database:
                     "author": row["author"],
                     "closed": row["closed"],
                     "admin_only": row["admin_only"],
+                    "slug": row["slug"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+            return None
+
+    async def get_topic_by_slug(self, slug):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT * FROM topics WHERE slug = $1", slug)
+            if row:
+                return {
+                    "id": str(row["id"]),
+                    "forum_id": row["forum_id"],
+                    "title": row["title"],
+                    "author": row["author"],
+                    "closed": row["closed"],
+                    "admin_only": row["admin_only"],
+                    "slug": row["slug"],
                     "created_at": row["created_at"].isoformat() if row["created_at"] else None,
                 }
             return None
 
     async def create_topic(self, forum_id, title, author, admin_only=False):
         tid = str(uuid.uuid4())
+        slug = secrets.token_hex(12)
         async with self.pool.acquire() as conn:
             await conn.execute(
-                "INSERT INTO topics (id, forum_id, title, author, admin_only) VALUES ($1, $2, $3, $4, $5)",
-                tid, forum_id, title, author, admin_only
+                "INSERT INTO topics (id, forum_id, title, author, admin_only, slug) VALUES ($1, $2, $3, $4, $5, $6)",
+                tid, forum_id, title, author, admin_only, slug
             )
         return {
             "id": tid,
@@ -416,6 +446,7 @@ class Database:
             "author": author,
             "closed": False,
             "admin_only": admin_only,
+            "slug": slug,
             "created_at": datetime.now().isoformat(),
         }
 
@@ -431,14 +462,19 @@ class Database:
 
     async def get_posts(self, topic_id):
         async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT * FROM posts WHERE topic_id = $1 ORDER BY created_at ASC", topic_id
-            )
+            rows = await conn.fetch("""
+                SELECT p.*, u.signature
+                FROM posts p
+                JOIN users u ON p.author = u.username
+                WHERE p.topic_id = $1
+                ORDER BY p.created_at ASC
+            """, topic_id)
             return [{
                 "id": str(row["id"]),
                 "topic_id": str(row["topic_id"]),
                 "author": row["author"],
                 "content": row["content"],
+                "signature": row["signature"] or "",
                 "created_at": row["created_at"].isoformat() if row["created_at"] else None,
             } for row in rows]
 
@@ -703,6 +739,9 @@ class ChatServer:
             "bot_broadcast": self.handle_bot_broadcast,
             "bot_create_post": self.handle_bot_create_post,
             "bot_create_topic": self.handle_bot_create_topic,
+            "set_signature": self.handle_set_signature,
+            "get_signature": self.handle_get_signature,
+            "resolve_topic_link": self.handle_resolve_topic_link,
         }
 
         handler = handlers.get(msg_type)
@@ -1296,6 +1335,40 @@ class ChatServer:
             await self.storage.create_post(topic["id"], BOT_USERNAME, content)
         await self.send(websocket, {"type": "bot_topic_created", "topic": topic})
 
+    async def handle_set_signature(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        user = self.clients[websocket]
+        signature = data.get("signature", "").strip()
+        if len(signature) > 50:
+            return await self.send(websocket, {"type": "error", "message": "Signature must be 50 characters or less"})
+        await self.storage.set_signature(user["username"], signature)
+        await self.send(websocket, {"type": "signature_updated", "message": "Signature updated"})
+
+    async def handle_get_signature(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        user = self.clients[websocket]
+        full_user = await self.storage.get_user(user["username"])
+        sig = full_user.get("signature", "") if full_user else ""
+        await self.send(websocket, {"type": "signature_data", "signature": sig})
+
+    async def handle_resolve_topic_link(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        slug = data.get("slug", "").strip()
+        if not slug:
+            return await self.send(websocket, {"type": "error", "message": "Slug required"})
+        topic = await self.storage.get_topic_by_slug(slug)
+        if not topic:
+            return await self.send(websocket, {"type": "error", "message": "Topic not found"})
+        await self.send(websocket, {
+            "type": "topic_link_resolved",
+            "forum_id": topic["forum_id"],
+            "topic_id": topic["id"],
+            "title": topic["title"],
+        })
+
     async def handle_ping(self, websocket, data):
         if not self.require_auth(websocket):
             return
@@ -1333,6 +1406,8 @@ class ChatServer:
                 return Response(200, "OK", Headers({"Content-Type": "application/javascript; charset=utf-8"}), APP_JS.encode("utf-8"))
             if request.path == "/style.css" and STYLE_CSS is not None:
                 return Response(200, "OK", Headers({"Content-Type": "text/css; charset=utf-8"}), STYLE_CSS.encode("utf-8"))
+            if request.path.startswith("/forums/") and INDEX_HTML is not None:
+                return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), INDEX_HTML.encode("utf-8"))
             return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"Not Found\n")
 
         loop = asyncio.get_running_loop()

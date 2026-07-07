@@ -6,3 +6,5 @@ Thumbs.db
 dist/
 build/
 *.spec
+/Chatwisp.exe
+/installer/

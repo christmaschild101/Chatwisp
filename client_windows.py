@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "2.1.0"
+VERSION = "3.0.0"
 import json
 import threading
 import queue
@@ -49,6 +49,9 @@ class ChatwispFrame(wx.Frame):
         self._tts_sapi = None
         self._pending_ping_time = 0
         self._pending_server_info = False
+        self.pending_topic = None
+
+        self._parse_protocol_args()
 
         self.recv_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_poll_recv, self.recv_timer)
@@ -72,6 +75,13 @@ class ChatwispFrame(wx.Frame):
 
     def announce(self, message):
         self.statusbar.SetStatusText(message)
+
+    def _parse_protocol_args(self):
+        for arg in sys.argv[1:]:
+            if arg.startswith("chatwisp://forums/"):
+                parts = arg.replace("chatwisp://forums/", "").split("/")
+                if len(parts) >= 2:
+                    self.pending_topic = {"forum_id": parts[0], "slug": parts[1]}
 
     def _tts_speak(self, text):
         for dll_name in ("nvdaControllerClient64", "nvdaControllerClient"):
@@ -255,8 +265,17 @@ class ChatwispFrame(wx.Frame):
             wx.MessageBox(data.get("message", ""), "Welcome", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "forums_list":
             self.show_forums(data["forums"])
+            if self.pending_topic:
+                self._send({"type": "resolve_topic_link", "slug": self.pending_topic["slug"]})
         elif dtype == "topics_list":
             self.show_topics(data["forum_id"], data["topics"])
+            if self.pending_topic and self.pending_topic.get("topic_id"):
+                pt = self.pending_topic
+                self.pending_topic = None
+                if pt["topic_id"] in self.topic_ids:
+                    idx = self.topic_ids.index(pt["topic_id"])
+                    self.topic_list.SetSelection(idx)
+                    self._do_topic_select()
         elif dtype == "posts_list":
             self.current_topic_data = data["topic"]
             self.show_posts(data["topic"], data["posts"])
@@ -380,6 +399,16 @@ class ChatwispFrame(wx.Frame):
             self.announce("Topic created as official account")
             if self.forum_id_stack:
                 self._request_topics(self.forum_id_stack[-1])
+        elif dtype == "signature_data":
+            if hasattr(self, 'sig_text'):
+                self.sig_text.SetValue(data.get("signature", ""))
+                self._on_sig_text(None)
+        elif dtype == "signature_updated":
+            self.announce("Signature saved")
+            wx.MessageBox("Signature updated", "Settings", wx.OK | wx.ICON_INFORMATION)
+        elif dtype == "topic_link_resolved":
+            self.pending_topic = {"forum_id": data["forum_id"], "topic_id": data["topic_id"]}
+            self._request_topics(data["forum_id"])
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -426,6 +455,9 @@ class ChatwispFrame(wx.Frame):
         msg_btn.Bind(wx.EVT_BUTTON, lambda e: self._send({"type": "get_dm_contacts"}))
         admin_sz = wx.BoxSizer(wx.HORIZONTAL)
         admin_sz.Add(msg_btn, 0, wx.RIGHT, 5)
+        settings_btn = wx.Button(pnl, label="Settings")
+        settings_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_settings())
+        admin_sz.Add(settings_btn, 0, wx.RIGHT, 5)
         if self.is_admin:
             admin_sz.Add(wx.StaticText(pnl, label="  Admin:  "), 0, wx.ALIGN_CENTER_VERTICAL)
             accts_btn = wx.Button(pnl, label="Accounts")
@@ -554,6 +586,9 @@ class ChatwispFrame(wx.Frame):
         topics_btn = wx.Button(pnl, label="Back to Topics")
         topics_btn.Bind(wx.EVT_BUTTON, lambda e: self._go_back_to_topics())
         nav_sz.Add(topics_btn, 0, wx.LEFT, 5)
+        copy_link_btn = wx.Button(pnl, label="Copy Topic Link")
+        copy_link_btn.Bind(wx.EVT_BUTTON, lambda e: self._copy_topic_link(topic))
+        nav_sz.Add(copy_link_btn, 0, wx.LEFT, 5)
         sz.Add(nav_sz, 0, wx.ALL, 10)
 
         if self.is_admin:
@@ -592,7 +627,10 @@ class ChatwispFrame(wx.Frame):
         self.posts_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
         self.posts_data = posts
         for p in posts:
-            self.posts_list.Append(f"{p['author']} said: {p['content']}")
+            display = p['content']
+            if p.get('signature'):
+                display += f"\n— {p['signature']}"
+            self.posts_list.Append(f"{p['author']} said: {display}")
         sz.Add(self.posts_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
         can_reply = not topic["closed"] and (not topic.get("admin_only") or self.is_admin)
@@ -1079,6 +1117,86 @@ class ChatwispFrame(wx.Frame):
         self._send({"type": "bot_create_topic", "forum_id": forum_id, "title": title, "content": content})
         self.announce("Creating topic as official account...")
 
+    def _copy_topic_link(self, topic):
+        forum_id = topic.get("forum_id", "")
+        slug = topic.get("slug", "")
+        if not forum_id or not slug:
+            wx.MessageBox("Topic link not available", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        web_url = f"https://chatwisp.onrender.com/forums/{forum_id}/{slug}"
+        chatwisp_url = f"chatwisp://forums/{forum_id}/{slug}"
+        dlg = wx.MessageDialog(None,
+            "What would you like to do with this topic link?\n\n"
+            "Yes - Open in Browser\n"
+            "No - Open in Windows Client\n"
+            "Cancel - Copy Link to Clipboard",
+            "Topic Link",
+            wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION
+        )
+        result = dlg.ShowModal()
+        dlg.Destroy()
+        if result == wx.ID_YES:
+            import webbrowser
+            webbrowser.open(web_url)
+        elif result == wx.ID_NO:
+            import subprocess
+            subprocess.Popen([sys.executable, chatwisp_url])
+        elif result == wx.ID_CANCEL:
+            if wx.TheClipboard.Open():
+                wx.TheClipboard.SetData(wx.TextDataObject(web_url))
+                wx.TheClipboard.Close()
+                self.announce("Topic link copied to clipboard")
+            else:
+                wx.MessageBox("Could not copy to clipboard", "Error", wx.OK | wx.ICON_ERROR)
+
+    def show_settings(self):
+        self.current_view = "settings"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Settings")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 3); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.ALL, 15)
+
+        sz.Add(wx.StaticText(pnl, label="Forum Signature:"), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.Add(wx.StaticText(pnl, label="This text will appear at the end of every post you make. Max 50 characters."), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(5)
+        self.sig_text = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        self.sig_text.SetMaxLength(50)
+        sz.Add(self.sig_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        self.sig_counter = wx.StaticText(pnl, label="0/50")
+        sz.Add(self.sig_counter, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        self.sig_text.Bind(wx.EVT_TEXT, self._on_sig_text)
+        sz.AddSpacer(10)
+        save_btn = wx.Button(pnl, label="Save Signature")
+        save_btn.Bind(wx.EVT_BUTTON, self._on_save_signature)
+        sz.Add(save_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddStretchSpacer()
+        back_btn = wx.Button(pnl, label="Back to Main Menu")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        sz.Add(back_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.sig_text.SetFocus()
+
+        self._send({"type": "get_signature"})
+        self.announce("Settings")
+
+    def _on_sig_text(self, event):
+        length = len(self.sig_text.GetValue())
+        self.sig_counter.SetLabel(f"{length}/50")
+
+    def _on_save_signature(self, event):
+        sig = self.sig_text.GetValue().strip()
+        if len(sig) > 50:
+            wx.MessageBox("Signature must be 50 characters or less", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "set_signature", "signature": sig})
+        self.announce("Saving signature...")
+
     # --- Private Messages ---
 
     def show_dm_contacts(self, contacts):
@@ -1103,7 +1221,6 @@ class ChatwispFrame(wx.Frame):
         for c in contacts:
             self.dm_list.Append(f"{c['username']}: {c['last_message']}")
         self.dm_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_dm_contact_select)
-        self.dm_list.Bind(wx.EVT_LISTBOX, self.on_dm_contact_select)
         sz.Add(self.dm_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
         pnl.SetSizer(sz)

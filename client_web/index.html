@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Chatwisp - Accessible Forum v2.1.0</title>
+<title>Chatwisp - Accessible Forum v3.0.0</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,11 +13,21 @@
     <nav id="main-nav" role="navigation" aria-label="Main navigation" hidden>
       <button id="home-btn" class="nav-btn" onclick="showMainMenu()">Home</button>
       <button id="messages-btn" class="nav-btn" onclick="showDmList()">Messages</button>
+      <button id="settings-btn" class="nav-btn" onclick="showSettings()">Settings</button>
     </nav>
   </header>
 
   <main id="main-content" role="main">
     <div id="view-login" class="view" aria-label="Login screen">
+      <div id="topic-link-choice" hidden aria-label="Topic link choice">
+        <h2>Topic Link Detected</h2>
+        <p>This link will take you to a topic. Where would you like to open it?</p>
+        <div class="btn-group">
+          <button id="choice-browser-btn" onclick="continueInBrowser()">Continue in Browser</button>
+          <button id="choice-windows-btn" onclick="continueInWindowsClient()">Continue in Windows Client</button>
+        </div>
+        <hr>
+      </div>
       <h2 id="login-title">Login / Register</h2>
       <form id="login-form" onsubmit="event.preventDefault(); doLogin();" aria-label="Login form">
         <div class="form-group">
@@ -54,6 +64,7 @@
           <button id="admin-topic-reopen-btn" onclick="adminReopenTopic()" hidden>Reopen Topic</button>
           <button id="admin-topic-adminonly-btn" onclick="adminToggleAdminOnly()" hidden>Make Admin Only</button>
           <button id="admin-topic-delete-btn" onclick="adminDeleteTopic()" hidden>Delete Topic</button>
+          <button id="copy-topic-link-btn" onclick="copyTopicLink()">Copy Topic Link</button>
         </div>
       </section>
 
@@ -106,6 +117,21 @@
         <button id="dm-send-btn" onclick="sendDm()">Send</button>
       </div>
       <button onclick="showDmList()">Back to Messages</button>
+    </div>
+
+    <div id="view-settings" class="view" hidden aria-label="Settings">
+      <h2>Settings</h2>
+      <section aria-label="Forum signature">
+        <h3>Forum Signature</h3>
+        <p>This text will appear at the end of every post you make. Max 50 characters.</p>
+        <div class="form-group">
+          <label for="sig-input">Signature:</label>
+          <input type="text" id="sig-input" maxlength="50" autocomplete="off" oninput="updateSigCounter()">
+        </div>
+        <p id="sig-counter" class="char-counter">0/50</p>
+        <button onclick="saveSignature()">Save Signature</button>
+      </section>
+      <button onclick="showMainMenu()">Back to Main Menu</button>
     </div>
 
     <div id="view-accounts" class="view" hidden aria-label="Accounts management">
