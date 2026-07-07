@@ -49,10 +49,6 @@ class ChatwispFrame(wx.Frame):
         self._tts_sapi = None
         self._pending_ping_time = 0
         self._pending_server_info = False
-        self.pending_topic = None
-
-        self._parse_protocol_args()
-
         self.recv_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_poll_recv, self.recv_timer)
 
@@ -75,13 +71,6 @@ class ChatwispFrame(wx.Frame):
 
     def announce(self, message):
         self.statusbar.SetStatusText(message)
-
-    def _parse_protocol_args(self):
-        for arg in sys.argv[1:]:
-            if arg.startswith("chatwisp://forums/"):
-                parts = arg.replace("chatwisp://forums/", "").split("/")
-                if len(parts) >= 2:
-                    self.pending_topic = {"forum_id": parts[0], "slug": parts[1]}
 
     def _tts_speak(self, text):
         for dll_name in ("nvdaControllerClient64", "nvdaControllerClient"):
@@ -265,17 +254,8 @@ class ChatwispFrame(wx.Frame):
             wx.MessageBox(data.get("message", ""), "Welcome", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "forums_list":
             self.show_forums(data["forums"])
-            if self.pending_topic:
-                self._send({"type": "resolve_topic_link", "slug": self.pending_topic["slug"]})
         elif dtype == "topics_list":
             self.show_topics(data["forum_id"], data["topics"])
-            if self.pending_topic and self.pending_topic.get("topic_id"):
-                pt = self.pending_topic
-                self.pending_topic = None
-                if pt["topic_id"] in self.topic_ids:
-                    idx = self.topic_ids.index(pt["topic_id"])
-                    self.topic_list.SetSelection(idx)
-                    self._do_topic_select()
         elif dtype == "posts_list":
             self.current_topic_data = data["topic"]
             self.show_posts(data["topic"], data["posts"])
@@ -406,9 +386,6 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "signature_updated":
             self.announce("Signature saved")
             wx.MessageBox("Signature updated", "Settings", wx.OK | wx.ICON_INFORMATION)
-        elif dtype == "topic_link_resolved":
-            self.pending_topic = {"forum_id": data["forum_id"], "topic_id": data["topic_id"]}
-            self._request_topics(data["forum_id"])
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -1124,30 +1101,12 @@ class ChatwispFrame(wx.Frame):
             wx.MessageBox("Topic link not available", "Error", wx.OK | wx.ICON_ERROR)
             return
         web_url = f"https://chatwisp.onrender.com/forums/{forum_id}/{slug}"
-        chatwisp_url = f"chatwisp://forums/{forum_id}/{slug}"
-        dlg = wx.MessageDialog(None,
-            "What would you like to do with this topic link?\n\n"
-            "Yes - Open in Browser\n"
-            "No - Open in Windows Client\n"
-            "Cancel - Copy Link to Clipboard",
-            "Topic Link",
-            wx.YES_NO | wx.CANCEL | wx.ICON_QUESTION
-        )
-        result = dlg.ShowModal()
-        dlg.Destroy()
-        if result == wx.ID_YES:
-            import webbrowser
-            webbrowser.open(web_url)
-        elif result == wx.ID_NO:
-            import subprocess
-            subprocess.Popen([sys.executable, chatwisp_url])
-        elif result == wx.ID_CANCEL:
-            if wx.TheClipboard.Open():
-                wx.TheClipboard.SetData(wx.TextDataObject(web_url))
-                wx.TheClipboard.Close()
-                self.announce("Topic link copied to clipboard")
-            else:
-                wx.MessageBox("Could not copy to clipboard", "Error", wx.OK | wx.ICON_ERROR)
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(web_url))
+            wx.TheClipboard.Close()
+            self.announce("Topic link copied to clipboard")
+        else:
+            wx.MessageBox("Could not copy to clipboard", "Error", wx.OK | wx.ICON_ERROR)
 
     def show_settings(self):
         self.current_view = "settings"

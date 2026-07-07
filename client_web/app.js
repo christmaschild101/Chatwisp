@@ -105,6 +105,9 @@ function handleServerMessage(data) {
     $('main-nav').hidden = false;
     showMainMenu();
     announce('Welcome, ' + username + '!');
+    if (pendingLink) {
+      sendMsg({ type: 'resolve_topic_link', slug: pendingLink.slug });
+    }
   } else if (type === 'welcome') {
     alert(data.message);
   } else if (type === 'unread_dms') {
@@ -955,14 +958,9 @@ function saveSignature() {
 function continueInBrowser() {
   $('topic-link-choice').hidden = true;
   $('login-username').focus();
-  announce('Please log in to continue to the topic');
+  announce('Log in to go directly to the topic');
 }
 
-function continueInWindowsClient() {
-  if (pendingLink) {
-    window.location.href = 'chatwisp://forums/' + pendingLink.forum_id + '/' + pendingLink.slug;
-  }
-}
 
 function escapeHtml(str) {
   const div = document.createElement('div');

@@ -19,13 +19,9 @@
 
   <main id="main-content" role="main">
     <div id="view-login" class="view" aria-label="Login screen">
-      <div id="topic-link-choice" hidden aria-label="Topic link choice">
-        <h2>Topic Link Detected</h2>
-        <p>This link will take you to a topic. Where would you like to open it?</p>
-        <div class="btn-group">
-          <button id="choice-browser-btn" onclick="continueInBrowser()">Continue in Browser</button>
-          <button id="choice-windows-btn" onclick="continueInWindowsClient()">Continue in Windows Client</button>
-        </div>
+      <div id="topic-link-choice" hidden aria-label="Topic link notice">
+        <p><strong>Topic Link Detected</strong> — Log in to go directly to the topic.</p>
+        <button id="choice-browser-btn" onclick="continueInBrowser()">Dismiss</button>
         <hr>
       </div>
       <h2 id="login-title">Login / Register</h2>

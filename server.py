@@ -195,6 +195,12 @@ class Database:
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS slug TEXT")
+            # Assign slugs to existing topics that don't have one yet
+            slugless = await conn.fetch("SELECT id FROM topics WHERE slug IS NULL OR slug = ''")
+            for row in slugless:
+                await conn.execute("UPDATE topics SET slug = $1 WHERE id = $2", secrets.token_hex(12), row["id"])
+            if slugless:
+                print(f"Assigned slugs to {len(slugless)} existing topics")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMPTZ")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT ''")
