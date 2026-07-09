@@ -6,6 +6,7 @@
 server.py              # WebSocket server (Python, websockets lib + asyncpg, bcrypt)
 client_windows.py      # Windows desktop client (wxPython)
 client_web/            # Static HTML+CSS+JS web client (no build step)
+client_web/music/      # 5 royalty-free MP3s served by server at /music/
 server_data/           # JSON seed files (read once on first database init)
 site/                  # Download page + Chatwisp.exe for distribution
 ```
@@ -50,7 +51,8 @@ Both hardcode `wss://chatwisp.onrender.com`.
 ## Building the Windows Executable
 
 ```bash
-pyinstaller --onefile --windowed --name Chatwisp.exe client_windows.py
+pip install pygame   # required for background music
+pyinstaller --onefile --windowed --name Chatwisp.exe --add-data "client_web/music/*.mp3;./music" client_windows.py
 cp dist/Chatwisp.exe site/Chatwisp.exe
 ```
 
@@ -69,6 +71,19 @@ Drop the six tables (users, forums, topics, posts, dms, settings) from the datab
 - Only super_admins can ban admin users.
 - Minimum password length is 8 characters.
 - No hardcoded credentials; all DB config comes from environment variables.
+
+## Background Music (v3.1.0)
+
+- 5 royalty-free MP3s (ByTheFire, Frozen-in-Time, Noisescape, TranquilReflections, Wonder)
+  sourced from https://www.no-copyright-music.com/relaxing/
+- Server serves MP3s from `/music/` endpoint (no directory listing)
+- Per-user music preferences stored as JSON in `music_prefs` column on users table
+- Three categories: main_menu, forum, topic — user picks a song for each
+- Volume set to 0.3 for screen reader compatibility
+- Windows client bundles MP3s in the exe via PyInstaller --add-data
+- Web client fetches from server via HTML5 Audio API
+- Music starts playing after MOTD on login; switches automatically on view changes
+- Settings UI in both clients with preview (10-second sample)
 
 ## Conventions
 
