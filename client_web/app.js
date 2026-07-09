@@ -17,6 +17,24 @@ let pendingLinkTopicId = null;
 let musicPrefs = {};
 let currentMusicCategory = null;
 let musicPlayer = null;
+let _audioUnlocked = false;
+let _pendingPlayCategory = null;
+
+function _initAudio() {
+  if (_audioUnlocked) return;
+  _audioUnlocked = true;
+  try {
+    var ctx = new (window.AudioContext || window.webkitAudioContext)();
+    ctx.resume();
+  } catch(e) {}
+  if (_pendingPlayCategory) {
+    var cat = _pendingPlayCategory;
+    _pendingPlayCategory = null;
+    playMusic(cat);
+  }
+}
+document.addEventListener('click', _initAudio, { once: true });
+document.addEventListener('keydown', _initAudio, { once: true });
 
 function $(id) { return document.getElementById(id); }
 
@@ -33,6 +51,10 @@ updateIsMobile();
 window.addEventListener('resize', updateIsMobile);
 
 function playMusic(category) {
+  if (!_audioUnlocked) {
+    _pendingPlayCategory = category;
+    return;
+  }
   var song = musicPrefs[category];
   if (song === undefined) song = 'ByTheFire';
   if (!song) { stopMusic(); return; }
@@ -57,6 +79,7 @@ function stopMusic() {
 
 function previewSong(song, duration) {
   if (!song) return;
+  if (!_audioUnlocked) return;
   stopMusic();
   duration = duration || 10;
   var audio = new Audio('/music/' + encodeURIComponent(song) + '.mp3');

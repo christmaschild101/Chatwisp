@@ -26,10 +26,10 @@ except ImportError:
 
 if getattr(sys, 'frozen', False):
     _BASE_DIR = sys._MEIPASS
+    MUSIC_DIR = os.path.join(_BASE_DIR, "music")
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
-MUSIC_DIR = os.path.join(_BASE_DIR, "music")
+    MUSIC_DIR = os.path.join(_BASE_DIR, "client_web", "music")
 AVAILABLE_SONGS = ["ByTheFire", "Frozen-in-Time", "Noisescape", "TranquilReflections", "Wonder"]
 
 
@@ -1271,6 +1271,8 @@ class ChatwispFrame(wx.Frame):
         self.announce("Saving signature...")
 
     def _populate_music_lists(self):
+        if not (hasattr(self, 'music_main_list') and hasattr(self, 'music_forum_list') and hasattr(self, 'music_topic_list')):
+            return
         prefs = self.music_prefs
         none_label = "(None)"
         songs = [none_label] + AVAILABLE_SONGS
@@ -1489,7 +1491,7 @@ class ChatwispFrame(wx.Frame):
 
     def on_char_hook(self, event):
         key = event.GetKeyCode()
-        if key == wx.WXK_RETURN:
+        if key in (wx.WXK_RETURN, wx.WXK_SPACE):
             focused = wx.Window.FindFocus()
             if focused == getattr(self, 'forum_list', None) and hasattr(self, 'forum_list'):
                 self._do_forum_select()
