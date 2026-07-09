@@ -16,7 +16,7 @@ VERSION = "3.0.1"
 
 SERVER_START_TIME = time.time()
 BOT_USERNAME = "Chatwisp Official Account"
-MINIMUM_CLIENT_VERSION = "2.0.0"
+MINIMUM_CLIENT_VERSION = "3.0.1"
 DOWNLOAD_URL = "https://chatwisp.onrender.com/"
 
 try:
