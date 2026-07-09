@@ -61,6 +61,9 @@ INDEX_HTML = _read_static("index.html")
 APP_JS = _read_static("app.js")
 STYLE_CSS = _read_static("style.css")
 
+MUSIC_DIR = os.path.join(CLIENT_WEB_DIR, "music")
+AVAILABLE_SONGS = ["ByTheFire", "Frozen-in-Time", "Noisescape", "TranquilReflections", "Wonder"]
+
 def _read_json(path, default=None):
     if default is None:
         default = {}
@@ -200,6 +203,7 @@ class Database:
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMPTZ")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
             await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT ''")
+            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS music_prefs TEXT NOT NULL DEFAULT '{}'")
             await conn.execute("UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
             await conn.execute("INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
 
@@ -338,6 +342,20 @@ class Database:
             await conn.execute(
                 "UPDATE users SET signature = $1 WHERE username = $2",
                 signature, username
+            )
+
+    async def get_music_prefs(self, username):
+        async with self.pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT music_prefs FROM users WHERE username = $1", username)
+            if row and row["music_prefs"]:
+                return json.loads(row["music_prefs"])
+            return {}
+
+    async def set_music_prefs(self, username, prefs):
+        async with self.pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE users SET music_prefs = $1 WHERE username = $2",
+                json.dumps(prefs), username
             )
 
     async def verify_password(self, username, password):
@@ -787,6 +805,8 @@ class ChatServer:
             "bot_create_topic": self.handle_bot_create_topic,
             "set_signature": self.handle_set_signature,
             "get_signature": self.handle_get_signature,
+            "get_music_prefs": self.handle_get_music_prefs,
+            "set_music_prefs": self.handle_set_music_prefs,
             "resolve_topic_link": self.handle_resolve_topic_link,
         }
 
@@ -1402,6 +1422,29 @@ class ChatServer:
         sig = full_user.get("signature", "") if full_user else ""
         await self.send(websocket, {"type": "signature_data", "signature": sig})
 
+    async def handle_get_music_prefs(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        user = self.clients[websocket]
+        prefs = await self.storage.get_music_prefs(user["username"])
+        await self.send(websocket, {"type": "music_prefs_data", "prefs": prefs})
+
+    async def handle_set_music_prefs(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        user = self.clients[websocket]
+        prefs = data.get("prefs", {})
+        if not isinstance(prefs, dict):
+            return await self.send(websocket, {"type": "error", "message": "Invalid prefs format"})
+        valid_keys = {"main_menu", "forum", "topic"}
+        for k in prefs:
+            if k not in valid_keys:
+                return await self.send(websocket, {"type": "error", "message": f"Invalid key: {k}"})
+            if prefs[k] not in ("", *AVAILABLE_SONGS):
+                return await self.send(websocket, {"type": "error", "message": f"Invalid song: {prefs[k]}"})
+        await self.storage.set_music_prefs(user["username"], prefs)
+        await self.send(websocket, {"type": "music_prefs_updated", "message": "Music preferences saved"})
+
     async def handle_resolve_topic_link(self, websocket, data):
         if not self.require_auth(websocket):
             return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
@@ -1457,6 +1500,13 @@ class ChatServer:
                 return Response(200, "OK", Headers({"Content-Type": "text/css; charset=utf-8"}), STYLE_CSS.encode("utf-8"))
             if request.path.startswith("/forums/") and INDEX_HTML is not None:
                 return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), INDEX_HTML.encode("utf-8"))
+            if request.path.startswith("/music/") and request.path.count("/") == 2:
+                filename = request.path.split("/")[-1]
+                filepath = os.path.join(MUSIC_DIR, filename)
+                if os.path.isfile(filepath):
+                    with open(filepath, "rb") as f:
+                        return Response(200, "OK", Headers({"Content-Type": "audio/mpeg"}), f.read())
+                return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"File not found\n")
             return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"Not Found\n")
 
         loop = asyncio.get_running_loop()

@@ -14,6 +14,10 @@ let pendingLink = null;
 let currentTopicSlug = null;
 let pendingLinkTopicId = null;
 
+let musicPrefs = {};
+let currentMusicCategory = null;
+let musicPlayer = null;
+
 function $(id) { return document.getElementById(id); }
 
 function announce(msg) {
@@ -28,11 +32,92 @@ function updateIsMobile() {
 updateIsMobile();
 window.addEventListener('resize', updateIsMobile);
 
+function playMusic(category) {
+  var song = musicPrefs[category];
+  if (!song) { stopMusic(); return; }
+  if (currentMusicCategory === category && musicPlayer && !musicPlayer.paused) return;
+  stopMusic();
+  var audio = new Audio('/music/' + encodeURIComponent(song) + '.mp3');
+  audio.loop = true;
+  audio.volume = 0.3;
+  audio.play().catch(function() {});
+  musicPlayer = audio;
+  currentMusicCategory = category;
+}
+
+function stopMusic() {
+  if (musicPlayer) {
+    musicPlayer.pause();
+    musicPlayer.currentTime = 0;
+    musicPlayer = null;
+  }
+  currentMusicCategory = null;
+}
+
+function previewSong(song, duration) {
+  if (!song) return;
+  stopMusic();
+  duration = duration || 10;
+  var audio = new Audio('/music/' + encodeURIComponent(song) + '.mp3');
+  audio.volume = 0.3;
+  audio.play().catch(function() {});
+  musicPlayer = audio;
+  currentMusicCategory = 'preview';
+  setTimeout(function() {
+    if (currentMusicCategory === 'preview') stopMusic();
+  }, duration * 1000);
+}
+
+function populateMusicSelects(prefs) {
+  var songs = ['', 'ByTheFire', 'Frozen-in-Time', 'Noisescape', 'TranquilReflections', 'Wonder'];
+  ['music-main-menu', 'music-forum', 'music-topic'].forEach(function(id) {
+    var sel = $(id);
+    if (!sel) return;
+    sel.innerHTML = '';
+    songs.forEach(function(s) {
+      var opt = document.createElement('option');
+      opt.value = s;
+      opt.textContent = s || '(None)';
+      sel.appendChild(opt);
+    });
+    var key = id.replace('music-', '').replace('-', '_');
+    if (prefs[key]) sel.value = prefs[key];
+  });
+}
+
+function saveMusicPrefs() {
+  var prefs = {
+    main_menu: $('music-main-menu').value,
+    forum: $('music-forum').value,
+    topic: $('music-topic').value
+  };
+  sendMsg({ type: 'set_music_prefs', prefs: prefs });
+}
+
+function previewSelected(category) {
+  var sel = $('music-' + category);
+  if (!sel) return;
+  var song = sel.value;
+  if (song) previewSong(song, 10);
+}
+
+function updateMusicForView() {
+  if (!username) { stopMusic(); return; }
+  if ($('post-section') && !$('post-section').hidden) {
+    playMusic('topic');
+  } else if ($('topic-section') && !$('topic-section').hidden) {
+    playMusic('forum');
+  } else {
+    playMusic('main_menu');
+  }
+}
+
 function showView(viewId) {
   document.querySelectorAll('.view').forEach(v => v.hidden = true);
   $(viewId).hidden = false;
   const el = $(viewId);
   if (el) el.focus();
+  updateMusicForView();
 }
 
 function hideAllSections() {
@@ -86,6 +171,7 @@ function doConnect(wsUrl, user, pass, mode) {
     hideAllSections();
     $('main-nav').hidden = true;
     $('login-title').textContent = 'Login / Register';
+    stopMusic();
   };
 
   ws.onerror = function() {
@@ -105,6 +191,7 @@ function handleServerMessage(data) {
     $('main-nav').hidden = false;
     showMainMenu();
     announce('Welcome, ' + username + '!');
+    sendMsg({ type: 'get_music_prefs' });
     if (pendingLink) {
       sendMsg({ type: 'resolve_topic_link', slug: pendingLink.slug });
     }
@@ -249,6 +336,13 @@ function handleServerMessage(data) {
   } else if (type === 'signature_updated') {
     announce('Signature saved');
     alert(data.message || 'Signature updated');
+  } else if (type === 'music_prefs_data') {
+    musicPrefs = data.prefs || {};
+    populateMusicSelects(musicPrefs);
+    playMusic('main_menu');
+  } else if (type === 'music_prefs_updated') {
+    announce('Music preferences saved');
+    alert(data.message || 'Music preferences saved');
   } else if (type === 'topic_link_resolved') {
     const forumId = data.forum_id;
     const topicId = data.topic_id;
@@ -322,6 +416,7 @@ function showMainMenu() {
   dmCurrentUser = null;
   announce('Loading forums...');
   sendMsg({ type: 'get_forums' });
+  updateMusicForView();
 }
 
 // --- Forums ---
@@ -357,6 +452,7 @@ function selectForum(forumId) {
   $('section-title').textContent = 'Topics';
   announce('Loading topics...');
   sendMsg({ type: 'get_topics', forum_id: forumId });
+  updateMusicForView();
 }
 
 // --- Topics ---
@@ -420,6 +516,7 @@ function selectTopic(topicId) {
   $('post-section').hidden = false;
   announce('Loading posts...');
   sendMsg({ type: 'get_posts', topic_id: topicId });
+  updateMusicForView();
 }
 
 // --- Posts ---
@@ -648,6 +745,7 @@ function showAccounts() {
 
 function renderUsers(users) {
   showView('view-accounts');
+  updateMusicForView();
   const list = $('users-list');
   list.innerHTML = '';
   users.forEach(function(u) {
@@ -938,6 +1036,8 @@ function showSettings() {
   $('sig-input').focus();
   updateSigCounter();
   announce('Settings');
+  updateMusicForView();
+  sendMsg({ type: 'get_music_prefs' });
 }
 
 function updateSigCounter() {
