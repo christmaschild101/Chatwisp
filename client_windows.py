@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "3.0.1"
+VERSION = "4.0.0"
 import json
 import threading
 import queue
@@ -109,6 +109,8 @@ class ChatwispFrame(wx.Frame):
 
     def _play_music(self, category):
         song = self.music_prefs.get(category)
+        if song is None:
+            song = "ByTheFire"
         if not song or not MUSIC_AVAILABLE:
             self._stop_music()
             return
@@ -463,7 +465,7 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "music_prefs_data":
             self.music_prefs = data.get("prefs", {})
             self._populate_music_lists()
-            self._play_music("main_menu")
+            self._update_music_for_view()
         elif dtype == "music_prefs_updated":
             self.announce("Music preferences saved")
             wx.MessageBox(data.get("message", "Music preferences saved"), "Settings", wx.OK | wx.ICON_INFORMATION)
@@ -1233,7 +1235,7 @@ class ChatwispFrame(wx.Frame):
         for lst, label in [(self.music_main_list, "Main Menu Music"), (self.music_forum_list, "Forum Music"), (self.music_topic_list, "Topic Music")]:
             lst_sz = wx.BoxSizer(wx.VERTICAL)
             lst_sz.Add(wx.StaticText(pnl, label=label), 0, wx.BOTTOM, 3)
-            lst.Bind(wx.EVT_CHAR_HOOK, self._on_music_list_key)
+            lst.Bind(wx.EVT_KEY_DOWN, self._on_music_list_key)
             lst_sz.Add(lst, 0, wx.EXPAND)
             sz.Add(lst_sz, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
@@ -1284,7 +1286,7 @@ class ChatwispFrame(wx.Frame):
     def _on_music_list_key(self, event):
         lst = event.GetEventObject()
         key = event.GetKeyCode()
-        if key == ord(' '):
+        if key == wx.WXK_SPACE:
             sel = lst.GetSelection()
             if sel >= 0:
                 song = lst.GetString(sel)

@@ -34,6 +34,7 @@ window.addEventListener('resize', updateIsMobile);
 
 function playMusic(category) {
   var song = musicPrefs[category];
+  if (song === undefined) song = 'ByTheFire';
   if (!song) { stopMusic(); return; }
   if (currentMusicCategory === category && musicPlayer && !musicPlayer.paused) return;
   stopMusic();
@@ -148,7 +149,7 @@ function doConnect(wsUrl, user, pass, mode) {
 
   ws.onopen = function() {
     announce('Connected. Authenticating...');
-    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "3.0.1" }));
+    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "4.0.0" }));
   };
 
   ws.onmessage = function(event) {
@@ -339,7 +340,7 @@ function handleServerMessage(data) {
   } else if (type === 'music_prefs_data') {
     musicPrefs = data.prefs || {};
     populateMusicSelects(musicPrefs);
-    playMusic('main_menu');
+    updateMusicForView();
   } else if (type === 'music_prefs_updated') {
     announce('Music preferences saved');
     alert(data.message || 'Music preferences saved');

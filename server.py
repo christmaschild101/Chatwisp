@@ -12,11 +12,11 @@ import sys
 import bcrypt
 from datetime import datetime, timedelta
 
-VERSION = "3.0.1"
+VERSION = "4.0.0"
 
 SERVER_START_TIME = time.time()
 BOT_USERNAME = "Chatwisp Official Account"
-MINIMUM_CLIENT_VERSION = "3.0.1"
+MINIMUM_CLIENT_VERSION = "4.0.0"
 DOWNLOAD_URL = "https://chatwisp-sight.onrender.com/"
 
 try:
