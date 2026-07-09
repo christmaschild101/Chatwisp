@@ -17,7 +17,7 @@ VERSION = "3.0.1"
 SERVER_START_TIME = time.time()
 BOT_USERNAME = "Chatwisp Official Account"
 MINIMUM_CLIENT_VERSION = "3.0.1"
-DOWNLOAD_URL = "https://chatwisp.onrender.com/"
+DOWNLOAD_URL = "https://chatwisp-sight.onrender.com/"
 
 try:
     import websockets
@@ -726,6 +726,21 @@ class ChatServer:
         self._login_attempts[key] = [t for t in self._login_attempts[key] if now - t < 60]
         self._login_attempts[key].append(now)
 
+    async def _reject_outdated_client(self, websocket, error_type, client_version):
+        if not client_version:
+            await self.send(websocket, {"type": error_type, "message": "Your client is out of date. Please download the latest version from " + DOWNLOAD_URL})
+            return True
+        try:
+            cv = tuple(int(x) for x in client_version.split("."))
+            sv = tuple(int(x) for x in VERSION.split("."))
+            if cv[0] != sv[0] or client_version < MINIMUM_CLIENT_VERSION:
+                await self.send(websocket, {"type": error_type, "message": f"Your client is out of date. Please download the latest version from {DOWNLOAD_URL}"})
+                return True
+        except (ValueError, IndexError):
+            await self.send(websocket, {"type": error_type, "message": "Your client is out of date. Please download the latest version from " + DOWNLOAD_URL})
+            return True
+        return False
+
     async def handle_message(self, websocket, raw):
         try:
             data = json.loads(raw)
@@ -793,15 +808,8 @@ class ChatServer:
             await self.send(websocket, {"type": "login_error", "message": "Too many login attempts. Please try again later."})
             return
         self._record_attempt(f"login:{ip}")
-        if client_version:
-            try:
-                cv = tuple(int(x) for x in client_version.split("."))
-                sv = tuple(int(x) for x in VERSION.split("."))
-                if cv[0] != sv[0] or client_version < MINIMUM_CLIENT_VERSION:
-                    await self.send(websocket, {"type": "login_error", "message": f"Your client is out of date. Please download the latest version from {DOWNLOAD_URL}"})
-                    return
-            except (ValueError, IndexError):
-                pass
+        if await self._reject_outdated_client(websocket, "login_error", client_version):
+            return
         user = await self.storage.get_user(username)
         if not user:
             await self.send(websocket, {"type": "login_error", "message": "Invalid username or password"})
@@ -867,15 +875,8 @@ class ChatServer:
             await self.send(websocket, {"type": "register_error", "message": "Too many registration attempts. Please try again later."})
             return
         self._record_attempt(f"register:{ip}")
-        if client_version:
-            try:
-                cv = tuple(int(x) for x in client_version.split("."))
-                sv = tuple(int(x) for x in VERSION.split("."))
-                if cv[0] != sv[0] or client_version < MINIMUM_CLIENT_VERSION:
-                    await self.send(websocket, {"type": "register_error", "message": f"Your client is out of date. Please download the latest version from {DOWNLOAD_URL}"})
-                    return
-            except (ValueError, IndexError):
-                pass
+        if await self._reject_outdated_client(websocket, "register_error", client_version):
+            return
         if len(username) < 3:
             await self.send(websocket, {"type": "register_error", "message": "Username must be at least 3 characters"})
             return
