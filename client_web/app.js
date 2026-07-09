@@ -63,7 +63,7 @@ function doConnect(wsUrl, user, pass, mode) {
 
   ws.onopen = function() {
     announce('Connected. Authenticating...');
-    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "3.0.0" }));
+    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "3.0.1" }));
   };
 
   ws.onmessage = function(event) {
@@ -297,8 +297,8 @@ function doRegister() {
     $('login-error').hidden = false;
     return;
   }
-  if (pass.length < 4) {
-    $('login-error').textContent = 'Password must be at least 4 characters';
+  if (pass.length < 8) {
+    $('login-error').textContent = 'Password must be at least 8 characters';
     $('login-error').hidden = false;
     return;
   }
@@ -723,7 +723,7 @@ function userAction(user) {
     }
   } else if (action === '6') {
     const newPass = prompt('Enter new password for ' + user.username + ':');
-    if (newPass && newPass.length >= 4) {
+    if (newPass && newPass.length >= 8) {
       const confirmPass = prompt('Confirm new password:');
       if (confirmPass === newPass) {
         if (confirm('Reset password for ' + user.username + '?')) {
@@ -734,7 +734,7 @@ function userAction(user) {
         alert('Passwords do not match');
       }
     } else if (newPass) {
-      alert('Password must be at least 4 characters');
+      alert('Password must be at least 8 characters');
     }
   }
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 import json
 import threading
 import queue
@@ -152,8 +152,8 @@ class ChatwispFrame(wx.Frame):
         if len(username) < 3:
             wx.MessageBox("Username must be at least 3 characters", "Error", wx.OK | wx.ICON_ERROR)
             return
-        if len(password) < 4:
-            wx.MessageBox("Password must be at least 4 characters", "Error", wx.OK | wx.ICON_ERROR)
+        if len(password) < 8:
+            wx.MessageBox("Password must be at least 8 characters", "Error", wx.OK | wx.ICON_ERROR)
             return
         self._do_auth("register")
 
@@ -913,8 +913,8 @@ class ChatwispFrame(wx.Frame):
         if dlg.ShowModal() == wx.ID_OK:
             p1 = new_pw.GetValue()
             p2 = confirm_pw.GetValue()
-            if not p1 or len(p1) < 4:
-                wx.MessageBox("Password must be at least 4 characters", "Error", wx.OK | wx.ICON_ERROR)
+            if not p1 or len(p1) < 8:
+                wx.MessageBox("Password must be at least 8 characters", "Error", wx.OK | wx.ICON_ERROR)
             elif p1 != p2:
                 wx.MessageBox("Passwords do not match", "Error", wx.OK | wx.ICON_ERROR)
             else:

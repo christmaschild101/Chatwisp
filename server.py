@@ -9,9 +9,10 @@ import signal
 import time
 import uuid
 import sys
+import bcrypt
 from datetime import datetime, timedelta
 
-VERSION = "3.0.0"
+VERSION = "3.0.1"
 
 SERVER_START_TIME = time.time()
 BOT_USERNAME = "Chatwisp Official Account"
@@ -101,15 +102,10 @@ class Database:
             port = int(os.environ.get("PGPORT", 5432))
             database = os.environ.get("PGDATABASE", "postgres")
             return {"host": host, "port": port, "user": user, "password": password, "database": database, "min_size": 1, "max_size": 3}
-        return {
-            "host": "aws-1-ca-central-1.pooler.supabase.com",
-            "port": 5432,
-            "user": "postgres.biwzptrgxgbojhgquwvo",
-            "password": "harpertheblindgamer2026@ca",
-            "database": "postgres",
-            "min_size": 1,
-            "max_size": 3,
-        }
+        raise RuntimeError(
+            "No database credentials configured. "
+            "Set DATABASE_URL (or PGDATABASE_URL), or set PGHOST, PGUSER, PGPASSWORD."
+        )
 
     async def connect(self):
         safe = {**self._connect_kwargs, "password": "***"}
@@ -283,7 +279,11 @@ class Database:
 
     @staticmethod
     def _hash(password):
-        return hashlib.sha256(password.encode()).hexdigest()
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    @staticmethod
+    def _is_sha256_hash(stored):
+        return len(stored) == 64 and all(c in "0123456789abcdef" for c in stored)
 
     @staticmethod
     def _parse_duration(text):
@@ -344,7 +344,18 @@ class Database:
         user = await self.get_user(username)
         if not user:
             return False
-        return user["password"] == self._hash(password)
+        stored = user["password"]
+        if self._is_sha256_hash(stored):
+            if hashlib.sha256(password.encode()).hexdigest() == stored:
+                new_hash = Database._hash(password)
+                async with self.pool.acquire() as conn:
+                    await conn.execute(
+                        "UPDATE users SET password_hash = $1 WHERE username = $2",
+                        new_hash, username
+                    )
+                return True
+            return False
+        return bcrypt.checkpw(password.encode(), stored.encode())
 
     async def has_admin(self):
         async with self.pool.acquire() as conn:
@@ -678,6 +689,7 @@ class ChatServer:
         self.port = port
         self.storage = Database()
         self.clients = {}
+        self._login_attempts = {}
 
     async def send(self, websocket, data):
         try:
@@ -700,6 +712,19 @@ class ChatServer:
         if not self.is_authenticated(websocket):
             return False
         return self.clients[websocket].get("super_admin", False)
+
+    def _is_rate_limited(self, key):
+        now = time.time()
+        attempts = self._login_attempts.get(key, [])
+        attempts = [t for t in attempts if now - t < 60]
+        self._login_attempts[key] = attempts
+        return len(attempts) >= 10
+
+    def _record_attempt(self, key):
+        now = time.time()
+        self._login_attempts.setdefault(key, [])
+        self._login_attempts[key] = [t for t in self._login_attempts[key] if now - t < 60]
+        self._login_attempts[key].append(now)
 
     async def handle_message(self, websocket, raw):
         try:
@@ -763,6 +788,11 @@ class ChatServer:
         if not username or not password:
             await self.send(websocket, {"type": "login_error", "message": "Username and password required"})
             return
+        ip = websocket.remote_address[0] if hasattr(websocket, "remote_address") else "unknown"
+        if self._is_rate_limited(f"login:{ip}"):
+            await self.send(websocket, {"type": "login_error", "message": "Too many login attempts. Please try again later."})
+            return
+        self._record_attempt(f"login:{ip}")
         if client_version:
             try:
                 cv = tuple(int(x) for x in client_version.split("."))
@@ -832,6 +862,11 @@ class ChatServer:
         if not username or not password:
             await self.send(websocket, {"type": "register_error", "message": "Username and password required"})
             return
+        ip = websocket.remote_address[0] if hasattr(websocket, "remote_address") else "unknown"
+        if self._is_rate_limited(f"register:{ip}"):
+            await self.send(websocket, {"type": "register_error", "message": "Too many registration attempts. Please try again later."})
+            return
+        self._record_attempt(f"register:{ip}")
         if client_version:
             try:
                 cv = tuple(int(x) for x in client_version.split("."))
@@ -844,8 +879,8 @@ class ChatServer:
         if len(username) < 3:
             await self.send(websocket, {"type": "register_error", "message": "Username must be at least 3 characters"})
             return
-        if len(password) < 4:
-            await self.send(websocket, {"type": "register_error", "message": "Password must be at least 4 characters"})
+        if len(password) < 8:
+            await self.send(websocket, {"type": "register_error", "message": "Password must be at least 8 characters"})
             return
         if await self.storage.get_user(username):
             await self.send(websocket, {"type": "register_error", "message": "Username already exists"})
@@ -1006,6 +1041,13 @@ class ChatServer:
             return
         if username == BOT_USERNAME:
             await self.send(websocket, {"type": "error", "message": "Cannot ban the official account"})
+            return
+        target = await self.storage.get_user(username)
+        if not target:
+            await self.send(websocket, {"type": "error", "message": "User not found"})
+            return
+        if target.get("is_admin") and not self.clients[websocket].get("super_admin", False):
+            await self.send(websocket, {"type": "error", "message": "Only super admins can ban other admins"})
             return
         reason = data.get("reason")
         duration = data.get("duration")
@@ -1278,8 +1320,8 @@ class ChatServer:
         if not user:
             await self.send(websocket, {"type": "error", "message": "User not found"})
             return
-        if len(new_password) < 4:
-            await self.send(websocket, {"type": "error", "message": "Password must be at least 4 characters"})
+        if len(new_password) < 8:
+            await self.send(websocket, {"type": "error", "message": "Password must be at least 8 characters"})
             return
         await self.storage.update_password(username, new_password)
         await self.send(websocket, {"type": "password_reset", "username": username, "message": f"Password for {username} has been reset"})
