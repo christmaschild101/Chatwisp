@@ -17,19 +17,25 @@ except ImportError:
     HAS_WEBSOCKETS = False
 
 MUSIC_AVAILABLE = False
+MUSIC_ERROR = None
 try:
     import pygame
     pygame.mixer.init()
     MUSIC_AVAILABLE = True
-except ImportError:
-    pass
+except Exception as e:
+    MUSIC_ERROR = str(e)
 
+MUSIC_DIR_OK = False
 if getattr(sys, 'frozen', False):
     _BASE_DIR = sys._MEIPASS
     MUSIC_DIR = os.path.join(_BASE_DIR, "music")
+    if os.path.isdir(MUSIC_DIR):
+        MUSIC_DIR_OK = True
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
     MUSIC_DIR = os.path.join(_BASE_DIR, "client_web", "music")
+    if os.path.isdir(MUSIC_DIR):
+        MUSIC_DIR_OK = True
 AVAILABLE_SONGS = ["ByTheFire", "Frozen-in-Time", "Noisescape", "TranquilReflections", "Wonder"]
 
 
@@ -39,7 +45,18 @@ class ChatwispFrame(wx.Frame):
         self.SetMinSize((600, 400))
 
         self.statusbar = self.CreateStatusBar()
-        self.statusbar.SetStatusText("Welcome to Chatwisp")
+        if not MUSIC_AVAILABLE:
+            reasons = []
+            if MUSIC_ERROR:
+                reasons.append(f"pygame init failed: {MUSIC_ERROR}")
+            if not MUSIC_DIR_OK:
+                reasons.append(f"music directory not found at {MUSIC_DIR}")
+            if reasons:
+                self.statusbar.SetStatusText("Music unavailable: " + "; ".join(reasons))
+            else:
+                self.statusbar.SetStatusText("Music unavailable")
+        else:
+            self.statusbar.SetStatusText("Welcome to Chatwisp")
 
         self.main_panel = wx.Panel(self)
         self.main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -123,6 +140,7 @@ class ChatwispFrame(wx.Frame):
             return
         path = os.path.join(MUSIC_DIR, song + ".mp3")
         if not os.path.exists(path):
+            self.announce(f"Music file not found: {path}")
             self._stop_music()
             return
         self._stop_music()
@@ -131,7 +149,8 @@ class ChatwispFrame(wx.Frame):
             pygame.mixer.music.set_volume(0.3)
             pygame.mixer.music.play(-1)
             self.music_category = category
-        except Exception:
+        except Exception as exc:
+            self.announce(f"Music playback error: {exc}")
             self.music_category = None
 
     def _stop_music(self):
@@ -147,6 +166,7 @@ class ChatwispFrame(wx.Frame):
             return
         path = os.path.join(MUSIC_DIR, song + ".mp3")
         if not os.path.exists(path):
+            self.announce(f"Preview file not found: {path}")
             return
         self._stop_music()
         try:
@@ -154,8 +174,8 @@ class ChatwispFrame(wx.Frame):
             pygame.mixer.music.set_volume(0.3)
             pygame.mixer.music.play(0)
             self.music_category = "preview"
-        except Exception:
-            pass
+        except Exception as exc:
+            self.announce(f"Music preview error: {exc}")
 
     def _update_music_for_view(self):
         if not self.username:
@@ -313,9 +333,13 @@ class ChatwispFrame(wx.Frame):
                 try:
                     self._handle_recv(msg)
                 except Exception as exc:
-                    print(f"Error handling message {msg[0]}: {exc}")
                     import traceback
-                    traceback.print_exc()
+                    err_msg = f"Internal error handling {msg[0]}: {exc}\n{traceback.format_exc()}"
+                    print(err_msg)
+                    try:
+                        wx.CallAfter(wx.MessageBox, err_msg, "Unexpected Error", wx.OK | wx.ICON_ERROR)
+                    except Exception:
+                        pass
         except queue.Empty:
             pass
         if self.connected and self.ws and time.time() - self._last_ping_time >= 30:
@@ -1299,7 +1323,12 @@ class ChatwispFrame(wx.Frame):
             lst_sz = wx.BoxSizer(wx.VERTICAL)
             lst_sz.Add(wx.StaticText(pnl, label=label), 0, wx.BOTTOM, 3)
             lst.Bind(wx.EVT_KEY_DOWN, self._on_music_list_key)
-            lst_sz.Add(lst, 0, wx.EXPAND)
+            inner = wx.BoxSizer(wx.HORIZONTAL)
+            inner.Add(lst, 1, wx.EXPAND)
+            preview_btn = wx.Button(pnl, label="Preview", style=wx.BU_EXACTFIT)
+            preview_btn.Bind(wx.EVT_BUTTON, lambda e, l=lst: self._on_music_preview_btn(l))
+            inner.Add(preview_btn, 0, wx.LEFT, 5)
+            lst_sz.Add(inner, 0, wx.EXPAND)
             sz.Add(lst_sz, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
 
         sz.AddSpacer(5)
@@ -1358,6 +1387,13 @@ class ChatwispFrame(wx.Frame):
                 if song and song != "(None)":
                     self._preview_song(song)
         event.Skip()
+
+    def _on_music_preview_btn(self, lst):
+        sel = lst.GetSelection()
+        if sel >= 0:
+            song = lst.GetString(sel)
+            if song and song != "(None)":
+                self._preview_song(song)
 
     def _on_save_music_prefs(self, event):
         songs = [""] + AVAILABLE_SONGS
@@ -1568,6 +1604,8 @@ class ChatwispFrame(wx.Frame):
             if focused == getattr(self, 'dm_list', None) and hasattr(self, 'dm_list'):
                 self.on_dm_contact_select(None)
                 return
+            event.Skip()
+            return
         elif key == wx.WXK_ESCAPE:
             if self.current_view == "login":
                 self.Close()

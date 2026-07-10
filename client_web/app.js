@@ -36,6 +36,8 @@ function _initAudio() {
     var ctx = new (window.AudioContext || window.webkitAudioContext)();
     ctx.resume();
   } catch(e) {}
+  var silent = new Audio();
+  silent.play().catch(function(){});
   if (_pendingPlayCategory) {
     var cat = _pendingPlayCategory;
     _pendingPlayCategory = null;
@@ -72,7 +74,9 @@ function playMusic(category) {
   var audio = new Audio('/music/' + encodeURIComponent(song) + '.mp3');
   audio.loop = true;
   audio.volume = 0.3;
-  audio.play().catch(function() {});
+  audio.play().catch(function(e) {
+    announce('Music playback failed: ' + (e.message || 'autoplay blocked'));
+  });
   musicPlayer = audio;
   currentMusicCategory = category;
 }
@@ -93,7 +97,9 @@ function previewSong(song, duration) {
   duration = duration || 10;
   var audio = new Audio('/music/' + encodeURIComponent(song) + '.mp3');
   audio.volume = 0.3;
-  audio.play().catch(function() {});
+  audio.play().catch(function(e) {
+    announce('Preview failed: ' + (e.message || 'autoplay blocked'));
+  });
   musicPlayer = audio;
   currentMusicCategory = 'preview';
   setTimeout(function() {
