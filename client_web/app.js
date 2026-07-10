@@ -14,6 +14,15 @@ let pendingLink = null;
 let currentTopicSlug = null;
 let pendingLinkTopicId = null;
 
+let savedWsUrl = null;
+let savedUser = null;
+let savedPass = null;
+let savedMode = null;
+let authenticated = false;
+let reconnectAttempts = 0;
+const maxReconnectAttempts = 20;
+let keepaliveInterval = null;
+
 let musicPrefs = {};
 let currentMusicCategory = null;
 let musicPlayer = null;
@@ -167,12 +176,22 @@ function connect() {
 }
 
 function doConnect(wsUrl, user, pass, mode) {
+  savedWsUrl = wsUrl;
+  savedUser = user;
+  savedPass = pass;
+  savedMode = mode;
   announce('Connecting...');
   ws = new WebSocket(wsUrl);
 
   ws.onopen = function() {
     announce('Connected. Authenticating...');
     ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "4.0.0" }));
+    if (keepaliveInterval) clearInterval(keepaliveInterval);
+    keepaliveInterval = setInterval(function() {
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        try { ws.send(JSON.stringify({ type: "ping", client_time: Date.now() / 1000 })); } catch(e) {}
+      }
+    }, 30000);
   };
 
   ws.onmessage = function(event) {
@@ -181,10 +200,22 @@ function doConnect(wsUrl, user, pass, mode) {
   };
 
   ws.onclose = function() {
+    if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
+    if (authenticated && reconnectAttempts < maxReconnectAttempts) {
+      reconnectAttempts++;
+      announce('Connection lost, reconnecting (' + reconnectAttempts + '/' + maxReconnectAttempts + ')...');
+      setTimeout(function() {
+        doConnect(savedWsUrl, savedUser, savedPass, savedMode);
+      }, 3000);
+      return;
+    }
+    reconnectAttempts = 0;
+    if (keepaliveInterval) { clearInterval(keepaliveInterval); keepaliveInterval = null; }
     if (username) {
       announce('Disconnected from server');
     }
     ws = null;
+    authenticated = false;
     username = null;
     isAdmin = false;
     isSuperAdmin = false;
@@ -209,6 +240,8 @@ function handleServerMessage(data) {
   const type = data.type;
 
   if (type === 'login_success') {
+    authenticated = true;
+    reconnectAttempts = 0;
     username = data.username;
     isAdmin = data.is_admin;
     isSuperAdmin = data.super_admin || false;

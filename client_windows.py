@@ -67,6 +67,11 @@ class ChatwispFrame(wx.Frame):
         self._tts_sapi = None
         self._pending_ping_time = 0
         self._pending_server_info = False
+        self._saved_username = None
+        self._saved_password = None
+        self._saved_uri = None
+        self._reconnecting = False
+        self._last_ping_time = 0
         self.recv_timer = wx.Timer(self)
         self.Bind(wx.EVT_TIMER, self.on_poll_recv, self.recv_timer)
 
@@ -241,6 +246,7 @@ class ChatwispFrame(wx.Frame):
         self.login_btn.Disable()
         self.register_btn.Disable()
         self.announce("Connecting to wss://chatwisp.onrender.com...")
+        self._saved_uri = "wss://chatwisp.onrender.com"
         threading.Thread(target=self._ws_connect, args=("wss://chatwisp.onrender.com", username, password, mode), daemon=True).start()
 
     def _ws_connect(self, uri, username, password, mode):
@@ -251,6 +257,8 @@ class ChatwispFrame(wx.Frame):
                 ws.send(json.dumps({"type": mode, "username": username, "password": password, "client_version": VERSION}))
                 response = json.loads(ws.recv())
                 if response.get("type") == "login_success":
+                    self._saved_username = response["username"]
+                    self._saved_password = password
                     self.username = response["username"]
                     self.is_admin = response.get("is_admin", False)
                     self.is_super_admin = response.get("super_admin", False)
@@ -274,13 +282,48 @@ class ChatwispFrame(wx.Frame):
             if self.running:
                 self.recv_queue.put(("disconnected", None))
 
+    def _reconnect_thread(self):
+        for attempt in range(45):
+            if not self.running:
+                return
+            try:
+                with websockets.sync.client.connect(self._saved_uri) as ws:
+                    ws.send(json.dumps({"type": "login", "username": self._saved_username, "password": self._saved_password, "client_version": VERSION}))
+                    response = json.loads(ws.recv())
+                    if response.get("type") == "login_success":
+                        self.ws = ws
+                        self.connected = True
+                        self._saved_username = response["username"]
+                        self.username = response["username"]
+                        self.is_admin = response.get("is_admin", False)
+                        self.is_super_admin = response.get("super_admin", False)
+                        self.recv_queue.put(("reconnected", response))
+                        self._ws_recv_loop(ws)
+                        return
+                    ws.close()
+            except Exception:
+                pass
+            time.sleep(3)
+        self.recv_queue.put(("reconnect_failed", None))
+
     def on_poll_recv(self, event):
         try:
             while True:
                 msg = self.recv_queue.get_nowait()
-                self._handle_recv(msg)
+                try:
+                    self._handle_recv(msg)
+                except Exception as exc:
+                    print(f"Error handling message {msg[0]}: {exc}")
+                    import traceback
+                    traceback.print_exc()
         except queue.Empty:
             pass
+        if self.connected and self.ws and time.time() - self._last_ping_time >= 30:
+            self._last_ping_time = time.time()
+            try:
+                self.ws.send(json.dumps({"type": "ping", "client_time": time.time()}))
+            except Exception:
+                pass
 
     def _handle_recv(self, msg):
         msg_type = msg[0]
@@ -310,10 +353,30 @@ class ChatwispFrame(wx.Frame):
             self.show_main_menu()
             return
 
+        if msg_type == "reconnected":
+            self._reconnecting = False
+            self.announce("Reconnected!")
+            wx.CallAfter(self.show_main_menu)
+            return
+
+        if msg_type == "reconnect_failed":
+            self._reconnecting = False
+            self._saved_username = None
+            self._saved_password = None
+            wx.MessageBox("Could not reconnect to server. Returning to login.", "Disconnected", wx.OK | wx.ICON_ERROR)
+            wx.CallAfter(self.show_login)
+            return
+
         if msg_type == "disconnected":
             self.connected = False
-            wx.MessageBox("Lost connection to server", "Disconnected", wx.OK | wx.ICON_ERROR)
-            self.show_login()
+            self.ws = None
+            if self._saved_username and self._saved_password and self._saved_uri and not self._reconnecting:
+                self.announce("Connection lost, reconnecting...")
+                self._reconnecting = True
+                threading.Thread(target=self._reconnect_thread, daemon=True).start()
+            else:
+                wx.MessageBox("Lost connection to server", "Disconnected", wx.OK | wx.ICON_ERROR)
+                wx.CallAfter(self.show_login)
             return
 
         if msg_type == "message":
