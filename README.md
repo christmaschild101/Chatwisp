@@ -25,5 +25,5 @@ python -m pip install -r requirements.txt
 ## Notes
 
 - This project is not yet complete.
-- Central server: `<domain to be determined later>`
+- Central server: `chatwisp.onrender.com`
 - Uses WebSockets (`ws://` / `wss://`).
