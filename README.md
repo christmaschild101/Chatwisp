@@ -1,29 +1,85 @@
 # Chatwisp
 
-> **Note:** This project's name may change in the future.
+A real-time chat application with forums, direct messages, and admin management. WebSocket-based with Python server and both web and Windows clients.
 
-## How to Use
+## Quick Start
 
-1. Download the source code (only if you plan to host your own server).
-
-2. Install the dependencies.
-
-If `pip` is available on your system:
+### Run your own server
 
 ```bash
 pip install -r requirements.txt
+python server.py --host 0.0.0.0 --port 8765
 ```
 
-If `pip` is not on your system's PATH:
+Requires a PostgreSQL database. On first run the server creates all tables and seeds them from `server_data/*.json`. Database credentials come from `DATABASE_URL`:
 
 ```bash
-python -m pip install -r requirements.txt
+export DATABASE_URL="postgresql://user:password@host:port/database"
 ```
 
-3. Start the server. All data, including accounts, forums, and other stored information, will be loaded automatically.
+### First admin account
 
-## Notes
+Send this message over WebSocket after connecting:
 
-- This project is not yet complete.
-- Central server: `<domain to be determined later>`
-- Uses WebSockets (`ws://` / `wss://`).
+```json
+{"type": "create_dev_account", "username": "admin", "password": "your_password"}
+```
+
+Only the first such message succeeds (no prior admin exists).
+
+### Connect a client
+
+- **Web client**: open `http://your-server:8765/` in any browser (server serves `client_web/`).
+- **Windows client**: `pip install wxPython && python client_windows.py`.
+
+Both clients default to `wss://chatwisp.onrender.com` — override the URL on the login screen to point to your server.
+
+### Connect to the central server
+
+Navigate to `https://chatwisp.onrender.com/` in a browser, or launch the Windows client and keep the default address. The central server runs the latest stable release.
+
+## Server configuration
+
+All configuration comes from environment variables:
+
+| Variable | Purpose |
+|---|---|
+| `DATABASE_URL` | PostgreSQL connection string |
+| `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGPORT`, `PGDATABASE` | Alternative to DATABASE_URL |
+| `PORT` | Port for the WebSocket server (Render sets this automatically) |
+
+## Features
+
+- **Forums** — Create, browse, and post in topic-based forums
+- **Direct messages** — Real-time one-on-one chat
+- **Admin panel** — Manage users, forums, topics; delete posts; ban users
+- **Signatures** — Per-user text signatures appended to posts
+- **Auto-reconnect** — Clients retry on disconnect with exponential backoff
+- **Keepalive pings** — Every 30 seconds to prevent proxy timeouts
+- **Rate limiting** — Max 10 login/register attempts per IP per 60 seconds
+- **bcrypt passwords** — SHA-256 legacy hashes auto-upgraded on login
+- **Security** — Minimum 8-char passwords, super_admin ban protection
+
+## Music
+
+The server serves 5 royalty-free MP3s from the `/music/` endpoint. Music was removed from both clients in v3.3.0. The MP3 files remain in `client_web/music/` (gitignored) for server-side use only.
+
+## Branch workflow
+
+- **`main`** — Working branch deployed to the central server at Render.
+- **`source`** — Mirrors `main` after stable releases for public consumption.
+
+## Development
+
+```bash
+git clone https://github.com/christmas-child/Chatwisp.git
+cd Chatwisp
+pip install -r requirements.txt
+python server.py
+```
+
+No tests, no build step, no CI. Pure Python + static HTML/JS.
+
+## License
+
+MIT
