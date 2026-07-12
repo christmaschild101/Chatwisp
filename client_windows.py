@@ -16,27 +16,10 @@ try:
 except ImportError:
     HAS_WEBSOCKETS = False
 
-MUSIC_AVAILABLE = False
-MUSIC_ERROR = None
-try:
-    import pygame
-    pygame.mixer.init()
-    MUSIC_AVAILABLE = True
-except Exception as e:
-    MUSIC_ERROR = str(e)
-
-MUSIC_DIR_OK = False
 if getattr(sys, 'frozen', False):
     _BASE_DIR = sys._MEIPASS
-    MUSIC_DIR = os.path.join(_BASE_DIR, "music")
-    if os.path.isdir(MUSIC_DIR):
-        MUSIC_DIR_OK = True
 else:
     _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    MUSIC_DIR = os.path.join(_BASE_DIR, "client_web", "music")
-    if os.path.isdir(MUSIC_DIR):
-        MUSIC_DIR_OK = True
-AVAILABLE_SONGS = ["ByTheFire", "Frozen-in-Time", "Noisescape", "TranquilReflections", "Wonder"]
 
 
 class ChatwispFrame(wx.Frame):
@@ -45,18 +28,7 @@ class ChatwispFrame(wx.Frame):
         self.SetMinSize((600, 400))
 
         self.statusbar = self.CreateStatusBar()
-        if not MUSIC_AVAILABLE:
-            reasons = []
-            if MUSIC_ERROR:
-                reasons.append(f"pygame init failed: {MUSIC_ERROR}")
-            if not MUSIC_DIR_OK:
-                reasons.append(f"music directory not found at {MUSIC_DIR}")
-            if reasons:
-                self.statusbar.SetStatusText("Music unavailable: " + "; ".join(reasons))
-            else:
-                self.statusbar.SetStatusText("Music unavailable")
-        else:
-            self.statusbar.SetStatusText("Welcome to Chatwisp")
+        self.statusbar.SetStatusText("Welcome to Chatwisp")
 
         self.main_panel = wx.Panel(self)
         self.main_sizer = wx.BoxSizer(wx.VERTICAL)
@@ -73,8 +45,6 @@ class ChatwispFrame(wx.Frame):
         self.forum_id_stack = []
         self.topic_id_stack = []
         self.current_view = None
-        self.music_prefs = {}
-        self.music_category = None
 
         self.recv_queue = queue.Queue()
         self.send_queue = queue.Queue()
@@ -129,65 +99,6 @@ class ChatwispFrame(wx.Frame):
         if self._tts_sapi:
             self._tts_sapi.Speak(text)
 
-    def _play_music(self, category):
-        song = self.music_prefs.get(category)
-        if song is None:
-            song = "ByTheFire"
-        if not song or not MUSIC_AVAILABLE:
-            self._stop_music()
-            return
-        if self.music_category == category:
-            return
-        path = os.path.join(MUSIC_DIR, song + ".mp3")
-        if not os.path.exists(path):
-            self.announce(f"Music file not found: {path}")
-            self._stop_music()
-            return
-        self._stop_music()
-        try:
-            pygame.mixer.music.load(path)
-            pygame.mixer.music.set_volume(0.3)
-            pygame.mixer.music.play(-1)
-            self.music_category = category
-        except Exception as exc:
-            self.announce(f"Music playback error: {exc}")
-            self.music_category = None
-
-    def _stop_music(self):
-        if MUSIC_AVAILABLE:
-            try:
-                pygame.mixer.music.stop()
-            except Exception:
-                pass
-        self.music_category = None
-
-    def _preview_song(self, song, duration=10):
-        if not song or not MUSIC_AVAILABLE:
-            return
-        path = os.path.join(MUSIC_DIR, song + ".mp3")
-        if not os.path.exists(path):
-            self.announce(f"Preview file not found: {path}")
-            return
-        self._stop_music()
-        try:
-            pygame.mixer.music.load(path)
-            pygame.mixer.music.set_volume(0.3)
-            pygame.mixer.music.play(0)
-            self.music_category = "preview"
-        except Exception as exc:
-            self.announce(f"Music preview error: {exc}")
-
-    def _update_music_for_view(self):
-        if not self.username:
-            self._stop_music()
-            return
-        if self.current_view == "posts":
-            self._play_music("topic")
-        elif self.current_view == "topics":
-            self._play_music("forum")
-        else:
-            self._play_music("main_menu")
-
     def switch_view(self, view_panel):
         self.main_sizer.Clear(delete_windows=False)
         if self.view_panel:
@@ -238,7 +149,6 @@ class ChatwispFrame(wx.Frame):
         self.switch_view(pnl)
         self.login_user.SetFocus()
         self.announce("Login screen. Enter your username and password.")
-        self._update_music_for_view()
 
     def on_login(self, event):
         self._do_auth("login")
@@ -414,7 +324,6 @@ class ChatwispFrame(wx.Frame):
         dtype = data.get("type")
         if dtype == "welcome":
             wx.MessageBox(data.get("message", ""), "Welcome", wx.OK | wx.ICON_INFORMATION)
-            self._send({"type": "get_music_prefs"})
         elif dtype == "forums_list":
             self.show_forums(data["forums"])
         elif dtype == "topics_list":
@@ -549,13 +458,6 @@ class ChatwispFrame(wx.Frame):
         elif dtype == "signature_updated":
             self.announce("Signature saved")
             wx.MessageBox("Signature updated", "Settings", wx.OK | wx.ICON_INFORMATION)
-        elif dtype == "music_prefs_data":
-            self.music_prefs = data.get("prefs", {})
-            self._populate_music_lists()
-            self._update_music_for_view()
-        elif dtype == "music_prefs_updated":
-            self.announce("Music preferences saved")
-            wx.MessageBox(data.get("message", "Music preferences saved"), "Settings", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "error":
             wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
             self.announce(f"Error: {data.get('message', '')}")
@@ -639,7 +541,6 @@ class ChatwispFrame(wx.Frame):
             self.forum_list.SetFocus()
             self.forum_list.SetSelection(0)
         self.announce(f"Forum list loaded. {len(forums)} forums.")
-        self._update_music_for_view()
 
     def _do_forum_select(self):
         idx = self.forum_list.GetSelection()
@@ -705,7 +606,6 @@ class ChatwispFrame(wx.Frame):
             self.topic_list.SetFocus()
             self.topic_list.SetSelection(0)
         self.announce(f"Topics loaded. {len(topics)} topics.")
-        self._update_music_for_view()
 
     def _do_topic_select(self):
         idx = self.topic_list.GetSelection()
@@ -803,7 +703,6 @@ class ChatwispFrame(wx.Frame):
         else:
             self.posts_list.SetFocus()
         self.announce(f"Posts loaded. {len(posts)} posts.")
-        self._update_music_for_view()
 
     def on_send_reply(self, event=None):
         content = self.reply_text.GetValue().strip()
@@ -1305,37 +1204,6 @@ class ChatwispFrame(wx.Frame):
         save_btn.Bind(wx.EVT_BUTTON, self._on_save_signature)
         sz.Add(save_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
-        sz.Add(wx.StaticLine(pnl), 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
-        sz.AddSpacer(10)
-        music_title = wx.StaticText(pnl, label="Menu Music")
-        f2 = music_title.GetFont(); f2 = f2.Bold()
-        music_title.SetFont(f2)
-        sz.Add(music_title, 0, wx.LEFT | wx.RIGHT, 10)
-        credit = wx.StaticText(pnl, label="Music credits: no-copyright-music.com/relaxing/")
-        credit.SetFont(credit.GetFont().Italic())
-        sz.Add(credit, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 5)
-
-        self.music_main_list = wx.ListBox(pnl, style=wx.LB_SINGLE, size=(-1, 80))
-        self.music_forum_list = wx.ListBox(pnl, style=wx.LB_SINGLE, size=(-1, 80))
-        self.music_topic_list = wx.ListBox(pnl, style=wx.LB_SINGLE, size=(-1, 80))
-
-        for lst, label in [(self.music_main_list, "Main Menu Music"), (self.music_forum_list, "Forum Music"), (self.music_topic_list, "Topic Music")]:
-            lst_sz = wx.BoxSizer(wx.VERTICAL)
-            lst_sz.Add(wx.StaticText(pnl, label=label), 0, wx.BOTTOM, 3)
-            lst.Bind(wx.EVT_KEY_DOWN, self._on_music_list_key)
-            inner = wx.BoxSizer(wx.HORIZONTAL)
-            inner.Add(lst, 1, wx.EXPAND)
-            preview_btn = wx.Button(pnl, label="Preview", style=wx.BU_EXACTFIT)
-            preview_btn.Bind(wx.EVT_BUTTON, lambda e, l=lst: self._on_music_preview_btn(l))
-            inner.Add(preview_btn, 0, wx.LEFT, 5)
-            lst_sz.Add(inner, 0, wx.EXPAND)
-            sz.Add(lst_sz, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
-
-        sz.AddSpacer(5)
-        save_music_btn = wx.Button(pnl, label="Save Music Settings")
-        save_music_btn.Bind(wx.EVT_BUTTON, self._on_save_music_prefs)
-        sz.Add(save_music_btn, 0, wx.LEFT | wx.RIGHT, 10)
-
         sz.AddStretchSpacer()
         back_btn = wx.Button(pnl, label="Back to Main Menu")
         back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
@@ -1346,9 +1214,7 @@ class ChatwispFrame(wx.Frame):
         self.sig_text.SetFocus()
 
         self._send({"type": "get_signature"})
-        self._send({"type": "get_music_prefs"})
         self.announce("Settings")
-        self._update_music_for_view()
 
     def _on_sig_text(self, event):
         length = len(self.sig_text.GetValue())
@@ -1361,55 +1227,6 @@ class ChatwispFrame(wx.Frame):
             return
         self._send({"type": "set_signature", "signature": sig})
         self.announce("Saving signature...")
-
-    def _populate_music_lists(self):
-        if not (hasattr(self, 'music_main_list') and hasattr(self, 'music_forum_list') and hasattr(self, 'music_topic_list')):
-            return
-        prefs = self.music_prefs
-        none_label = "(None)"
-        songs = [none_label] + AVAILABLE_SONGS
-        for lst, key in [(self.music_main_list, "main_menu"), (self.music_forum_list, "forum"), (self.music_topic_list, "topic")]:
-            lst.Clear()
-            for s in songs:
-                lst.Append(s)
-            val = prefs.get(key, "")
-            idx = songs.index(val) if val in songs else 0
-            lst.SetSelection(idx)
-            lst.SetClientData(idx, val)
-
-    def _on_music_list_key(self, event):
-        lst = event.GetEventObject()
-        key = event.GetKeyCode()
-        if key == wx.WXK_SPACE:
-            sel = lst.GetSelection()
-            if sel >= 0:
-                song = lst.GetString(sel)
-                if song and song != "(None)":
-                    self._preview_song(song)
-        event.Skip()
-
-    def _on_music_preview_btn(self, lst):
-        sel = lst.GetSelection()
-        if sel >= 0:
-            song = lst.GetString(sel)
-            if song and song != "(None)":
-                self._preview_song(song)
-
-    def _on_save_music_prefs(self, event):
-        songs = [""] + AVAILABLE_SONGS
-        def get_val(lst):
-            sel = lst.GetSelection()
-            return lst.GetString(sel) if sel >= 0 else ""
-        prefs = {
-            "main_menu": get_val(self.music_main_list),
-            "forum": get_val(self.music_forum_list),
-            "topic": get_val(self.music_topic_list),
-        }
-        for k in prefs:
-            if prefs[k] == "(None)":
-                prefs[k] = ""
-        self._send({"type": "set_music_prefs", "prefs": prefs})
-        self.announce("Saving music preferences...")
 
     # --- Private Messages ---
 
@@ -1443,7 +1260,6 @@ class ChatwispFrame(wx.Frame):
             self.dm_list.SetFocus()
             self.dm_list.SetSelection(0)
         self.announce(f"{len(contacts)} conversations.")
-        self._update_music_for_view()
 
     def on_dm_contact_select(self, event):
         idx = self.dm_list.GetSelection()
@@ -1552,7 +1368,6 @@ class ChatwispFrame(wx.Frame):
         self._send({"type": "get_dm_conversation", "username": self.dm_contact})
         self._send({"type": "mark_dms_read", "username": self.dm_contact})
         self.announce(f"Chat with {self.dm_contact}")
-        self._update_music_for_view()
 
     def show_dm_conversation(self, messages):
         if not hasattr(self, 'dm_message_list'):

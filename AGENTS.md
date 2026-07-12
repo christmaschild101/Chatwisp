@@ -6,9 +6,20 @@
 server.py              # WebSocket server (Python, websockets lib + asyncpg, bcrypt)
 client_windows.py      # Windows desktop client (wxPython)
 client_web/            # Static HTML+CSS+JS web client (no build step)
-client_web/music/      # 5 royalty-free MP3s served by server at /music/
+client_web/music/      # MP3s served by server at /music/ (gitignored)
 server_data/           # JSON seed files (read once on first database init)
 site/                  # Download page + Chatwisp.exe for distribution
+```
+
+## Branch workflow
+
+- **`main`** — working branch, deployed to central server (Render).
+- **`source`** — public release branch. Merge `main` into `source` after stable releases.
+
+After pushing a release, do:
+
+```bash
+git checkout source && git merge main && git push origin source && git checkout main
 ```
 
 ## Running
@@ -24,6 +35,7 @@ Requires a PostgreSQL database. On first run the server reads `server_data/*.jso
 ## Database
 
 Connection comes from the `DATABASE_URL` env var (or `PGDATABASE_URL`). Example:
+
 ```
 postgresql://user:password@host:port/database
 ```
@@ -38,23 +50,32 @@ On first run, the server creates these tables automatically:
 - **`posts`** — id (UUID), topic_id (FK→topics), author (FK→users), content, created_at
 - **`dms`** — id (UUID), sender (FK→users), recipient (FK→users), content, read, created_at
 - **`settings`** — key (text PK), value (text) — stores server config like MOTD
+- **`music_prefs`** column on users table (JSON string, kept for DB compat)
 
 To reset the database: drop the six tables and restart the server — it will re-seed from `server_data/*.json` on the next startup.
 
 ## Clients
 
-Both hardcode `wss://chatwisp.onrender.com`.
+Both default to `wss://chatwisp.onrender.com`.
 
-- **Web client**: navigate to `https://chatwisp.onrender.com/` in any browser (server serves the static files from `client_web/`). Can also open `client_web/index.html` locally but same-origin fetching works better.
+- **Web client**: navigate to `https://chatwisp.onrender.com/` in any browser (server serves the static files from `client_web/`).
 - **Windows client**: `pip install wxPython && python client_windows.py`.
 
 ## Building the Windows Executable
 
+Music was removed from the client, so pygame is no longer needed:
+
 ```bash
-pip install pygame   # required for background music
-pyinstaller --onefile --windowed --name Chatwisp.exe --add-data "client_web/music/*.mp3;./music" client_windows.py
+pip install wxPython
+pyinstaller --onefile --windowed --name Chatwisp.exe client_windows.py
 cp dist/Chatwisp.exe site/Chatwisp.exe
 ```
+
+**Note**: PyInstaller cross-compilation does not work. Build on Windows only.
+
+## Music
+
+Music code was removed from both clients in v3.3.0. The server still serves MP3s from `/music/` and the DB still has the `music_prefs` column — these are left in place for backward compatibility and are harmless.
 
 ## Admin account
 
@@ -71,19 +92,6 @@ Drop the six tables (users, forums, topics, posts, dms, settings) from the datab
 - Only super_admins can ban admin users.
 - Minimum password length is 8 characters.
 - No hardcoded credentials; all DB config comes from environment variables.
-
-## Background Music (v3.1.0)
-
-- 5 royalty-free MP3s (ByTheFire, Frozen-in-Time, Noisescape, TranquilReflections, Wonder)
-  sourced from https://www.no-copyright-music.com/relaxing/
-- Server serves MP3s from `/music/` endpoint (no directory listing)
-- Per-user music preferences stored as JSON in `music_prefs` column on users table
-- Three categories: main_menu, forum, topic — user picks a song for each
-- Volume set to 0.3 for screen reader compatibility
-- Windows client bundles MP3s in the exe via PyInstaller --add-data
-- Web client fetches from server via HTML5 Audio API
-- Music starts playing after MOTD on login; switches automatically on view changes
-- Settings UI in both clients with preview (10-second sample)
 
 ## Conventions
 
