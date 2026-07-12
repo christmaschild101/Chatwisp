@@ -20,7 +20,7 @@ export DATABASE_URL="postgresql://user:password@host:port/database"
 python server.py
 ```
 
-On first run the server creates all tables and seeds them from `server_data/*.json`.
+On first run the server creates all tables automatically and populates three starter forums (General Discussion, Technology, Off Topic). The first admin account is created via WebSocket.
 
 ### First admin account
 
