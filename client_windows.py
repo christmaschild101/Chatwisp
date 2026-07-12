@@ -2,6 +2,7 @@
 import wx
 
 VERSION = "4.0.0"
+DEFAULT_URI = "wss://chatwisp.onrender.com"
 import json
 import threading
 import queue
@@ -76,7 +77,7 @@ class ChatwispFrame(wx.Frame):
         self.Bind(wx.EVT_MENU, self.on_ctrl_o, id=self.ID_REOPEN)
         self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
 
-        self.show_login()
+        self.show_server_select()
         self.recv_timer.Start(100)
 
     def announce(self, message):
@@ -108,9 +109,87 @@ class ChatwispFrame(wx.Frame):
         self.main_panel.Layout()
         view_panel.SetFocus()
 
+    # --- Server Selection ---
+
+    def show_server_select(self):
+        self.current_view = "server_select"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Chatwisp - Select Server")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 4); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
+        sz.AddStretchSpacer()
+
+        central_btn = wx.Button(pnl, label="Connect to Central Server")
+        central_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_login(DEFAULT_URI))
+        sz.Add(central_btn, 0, wx.LEFT | wx.RIGHT, 40)
+        sz.AddSpacer(10)
+
+        ext_label = wx.StaticText(pnl, label="Or connect to your own server:")
+        sz.Add(ext_label, 0, wx.LEFT | wx.RIGHT, 40)
+        sz.AddSpacer(5)
+
+        ext_btn = wx.Button(pnl, label="Connect to External Server")
+        ext_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_external_server())
+        sz.Add(ext_btn, 0, wx.LEFT | wx.RIGHT, 40)
+
+        sz.AddStretchSpacer()
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        central_btn.SetFocus()
+        self.announce("Server selection. Connect to central server or an external server.")
+
+    def show_external_server(self):
+        self.current_view = "external_server"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="External Server")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 4); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
+        sz.AddSpacer(15)
+
+        gs = wx.FlexGridSizer(2, 2, 8, 15)
+        gs.AddGrowableCol(1)
+
+        gs.Add(wx.StaticText(pnl, label="Server Address:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
+        self.server_uri = wx.TextCtrl(pnl, value="ws://")
+        gs.Add(self.server_uri, 0, wx.EXPAND | wx.RIGHT, 20)
+
+        sz.Add(gs, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 10)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        connect_btn = wx.Button(pnl, label="Connect")
+        connect_btn.Bind(wx.EVT_BUTTON, self._on_external_connect)
+        btn_sz.Add(connect_btn, 0, wx.RIGHT, 8)
+
+        back_btn = wx.Button(pnl, label="Back")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_server_select())
+        btn_sz.Add(back_btn, 0, wx.LEFT, 8)
+
+        sz.Add(btn_sz, 0, wx.LEFT, 20)
+        sz.AddStretchSpacer()
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.server_uri.SetFocus()
+        self.announce("Enter external server address.")
+
+    def _on_external_connect(self, event):
+        uri = self.server_uri.GetValue().strip()
+        if not uri:
+            wx.MessageBox("Please enter a server address", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self.show_login(uri)
+
     # --- Login View ---
 
-    def show_login(self):
+    def show_login(self, uri=None):
+        if uri is None:
+            uri = DEFAULT_URI
+        self._server_uri = uri
         self.current_view = "login"
         pnl = wx.Panel(self.main_panel)
         sz = wx.BoxSizer(wx.VERTICAL)
@@ -120,6 +199,10 @@ class ChatwispFrame(wx.Frame):
         title.SetFont(f)
         sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
         sz.AddSpacer(15)
+
+        server_label = wx.StaticText(pnl, label=f"Server: {uri}")
+        sz.Add(server_label, 0, wx.LEFT | wx.RIGHT, 25)
+        sz.AddSpacer(10)
 
         gs = wx.FlexGridSizer(2, 2, 8, 15)
         gs.AddGrowableCol(1)
@@ -148,7 +231,7 @@ class ChatwispFrame(wx.Frame):
         pnl.SetSizer(sz)
         self.switch_view(pnl)
         self.login_user.SetFocus()
-        self.announce("Login screen. Enter your username and password.")
+        self.announce(f"Login screen. Server: {uri}. Enter your username and password.")
 
     def on_login(self, event):
         self._do_auth("login")
@@ -175,9 +258,10 @@ class ChatwispFrame(wx.Frame):
             return
         self.login_btn.Disable()
         self.register_btn.Disable()
-        self.announce("Connecting to wss://chatwisp.onrender.com...")
-        self._saved_uri = "wss://chatwisp.onrender.com"
-        threading.Thread(target=self._ws_connect, args=("wss://chatwisp.onrender.com", username, password, mode), daemon=True).start()
+        uri = self._server_uri
+        self.announce(f"Connecting to {uri}...")
+        self._saved_uri = uri
+        threading.Thread(target=self._ws_connect, args=(uri, username, password, mode), daemon=True).start()
 
     def _ws_connect(self, uri, username, password, mode):
         try:
@@ -298,7 +382,7 @@ class ChatwispFrame(wx.Frame):
             self._saved_username = None
             self._saved_password = None
             wx.MessageBox("Could not reconnect to server. Returning to login.", "Disconnected", wx.OK | wx.ICON_ERROR)
-            wx.CallAfter(self.show_login)
+            wx.CallAfter(self.show_server_select)
             return
 
         if msg_type == "disconnected":
@@ -310,7 +394,7 @@ class ChatwispFrame(wx.Frame):
                 threading.Thread(target=self._reconnect_thread, daemon=True).start()
             else:
                 wx.MessageBox("Lost connection to server", "Disconnected", wx.OK | wx.ICON_ERROR)
-                wx.CallAfter(self.show_login)
+                wx.CallAfter(self.show_server_select)
             return
 
         if msg_type == "message":
