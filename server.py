@@ -1816,14 +1816,10 @@ class ChatServer:
         })
 
     async def handle_ping(self, websocket, data):
-        if not self.require_auth(websocket):
-            return
         client_time = data.get("client_time", 0)
         await self.send(websocket, {"type": "pong", "client_time": client_time, "server_time": time.time()})
 
     async def handle_server_info(self, websocket, data):
-        if not self.require_auth(websocket):
-            return
         uptime = int(time.time() - SERVER_START_TIME)
         await self.send(websocket, {"type": "server_info", "uptime": uptime})
 
