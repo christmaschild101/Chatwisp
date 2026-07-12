@@ -27,10 +27,22 @@ except ImportError:
     print("Error: websockets library not found. Run: pip install websockets")
     sys.exit(1)
 
+_HAS_PG = False
 try:
     import asyncpg
+    _HAS_PG = True
 except ImportError:
-    print("Error: asyncpg library not found. Run: pip install asyncpg")
+    pass
+
+_HAS_SQLITE = False
+try:
+    import aiosqlite
+    _HAS_SQLITE = True
+except ImportError:
+    pass
+
+if not _HAS_PG and not _HAS_SQLITE:
+    print("Error: neither asyncpg nor aiosqlite found. Run: pip install -r requirements.txt")
     sys.exit(1)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "server_data")
@@ -73,49 +85,60 @@ def _read_json(path, default=None):
     return default
 
 
-class Database:
+def _detect_db_mode():
+    dsn = os.environ.get("DATABASE_URL") or os.environ.get("PGDATABASE_URL")
+    if dsn:
+        return "postgres"
+    host = os.environ.get("PGHOST")
+    user = os.environ.get("PGUSER")
+    password = os.environ.get("PGPASSWORD")
+    if host and user and password:
+        return "postgres"
+    return "sqlite"
+
+
+def _parse_pg_dsn(dsn):
+    dsn = dsn.split("://", 1)[1] if "://" in dsn else dsn
+    userinfo, hostport = dsn.rsplit("@", 1)
+    user, _, password = userinfo.partition(":")
+    from urllib.parse import unquote
+    user = unquote(user)
+    password = unquote(password)
+    host = hostport
+    port = 5432
+    database = "postgres"
+    if "/" in host:
+        host, _, database = host.partition("/")
+        database = unquote(database)
+    if ":" in host:
+        host, _, port_str = host.rpartition(":")
+        port = int(port_str)
+    return {"host": host, "port": port, "user": user, "password": password, "database": database, "min_size": 1, "max_size": 3}
+
+
+class _PostgresBackend:
     def __init__(self):
         self.pool = None
-        self._connect_kwargs = self._resolve_connect_kwargs()
-
-    @staticmethod
-    def _resolve_connect_kwargs():
-        dsn = os.environ.get("DATABASE_URL") or os.environ.get("PGDATABASE_URL")
-        if dsn:
-            dsn = dsn.split("://", 1)[1] if "://" in dsn else dsn
-            userinfo, hostport = dsn.rsplit("@", 1)
-            user, _, password = userinfo.partition(":")
-            from urllib.parse import unquote
-            user = unquote(user)
-            password = unquote(password)
-            host = hostport
-            port = 5432
-            database = "postgres"
-            if "/" in host:
-                host, _, database = host.partition("/")
-                database = unquote(database)
-            if ":" in host:
-                host, _, port_str = host.rpartition(":")
-                port = int(port_str)
-            return {"host": host, "port": port, "user": user, "password": password, "database": database, "min_size": 1, "max_size": 3}
-        host = os.environ.get("PGHOST")
-        user = os.environ.get("PGUSER")
-        password = os.environ.get("PGPASSWORD")
-        if host and user and password:
-            port = int(os.environ.get("PGPORT", 5432))
-            database = os.environ.get("PGDATABASE", "postgres")
-            return {"host": host, "port": port, "user": user, "password": password, "database": database, "min_size": 1, "max_size": 3}
-        raise RuntimeError(
-            "No database credentials configured. "
-            "Set DATABASE_URL (or PGDATABASE_URL), or set PGHOST, PGUSER, PGPASSWORD."
-        )
 
     async def connect(self):
-        safe = {**self._connect_kwargs, "password": "***"}
-        print(f"Connecting to database: host={safe.get('host')} port={safe.get('port')} user={safe.get('user')} database={safe.get('database')}", flush=True)
+        dsn = os.environ.get("DATABASE_URL") or os.environ.get("PGDATABASE_URL")
+        if dsn:
+            kwargs = _parse_pg_dsn(dsn)
+        else:
+            kwargs = {
+                "host": os.environ["PGHOST"],
+                "port": int(os.environ.get("PGPORT", 5432)),
+                "user": os.environ["PGUSER"],
+                "password": os.environ["PGPASSWORD"],
+                "database": os.environ.get("PGDATABASE", "postgres"),
+                "min_size": 1,
+                "max_size": 3,
+            }
+        safe = {**kwargs, "password": "***"}
+        print(f"Connecting to PostgreSQL: host={safe.get('host')} port={safe.get('port')} user={safe.get('user')} database={safe.get('database')}", flush=True)
         for attempt in range(5):
             try:
-                self.pool = await asyncpg.create_pool(**self._connect_kwargs)
+                self.pool = await asyncpg.create_pool(**kwargs)
                 break
             except asyncpg.InvalidPasswordError:
                 raise
@@ -125,16 +148,144 @@ class Database:
                     await asyncio.sleep(3)
         else:
             raise RuntimeError("Could not connect to database after 5 attempts")
-        await self._init_schema()
-        await self._seed_from_json()
 
     async def close(self):
         if self.pool:
             await self.pool.close()
 
-    async def _init_schema(self):
+    async def execute(self, sql, *args):
         async with self.pool.acquire() as conn:
-            await conn.execute("""
+            return await conn.execute(sql, *args)
+
+    async def fetchrow(self, sql, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchrow(sql, *args)
+
+    async def fetch(self, sql, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetch(sql, *args)
+
+    async def fetchval(self, sql, *args):
+        async with self.pool.acquire() as conn:
+            return await conn.fetchval(sql, *args)
+
+    @staticmethod
+    def row_to_dict(row, columns=None):
+        if row is None:
+            return None
+        return dict(row)
+
+    @staticmethod
+    def rows_to_list(rows):
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def status_matches(result, prefix):
+        return result and result.startswith(prefix)
+
+    @staticmethod
+    def placeholder():
+        return "$"
+
+
+class _SqliteBackend:
+    def __init__(self):
+        self.db = None
+
+    async def connect(self):
+        db_path = os.environ.get("SQLITE_PATH", "chatwisp.db")
+        print(f"Using SQLite database: {db_path}", flush=True)
+        self.db = await aiosqlite.connect(db_path)
+        self.db.row_factory = aiosqlite.Row
+        await self.db.execute("PRAGMA journal_mode=WAL")
+        await self.db.execute("PRAGMA foreign_keys=ON")
+
+    async def close(self):
+        if self.db:
+            await self.db.close()
+
+    def _sql(self, sql):
+        import re
+        return re.sub(r'\$(\d+)', '?', sql)
+
+    async def execute(self, sql, *args):
+        cursor = await self.db.execute(self._sql(sql), args)
+        await self.db.commit()
+        return cursor.rowcount
+
+    async def fetchrow(self, sql, *args):
+        cursor = await self.db.execute(self._sql(sql), args)
+        row = await cursor.fetchone()
+        return row
+
+    async def fetch(self, sql, *args):
+        cursor = await self.db.execute(self._sql(sql), args)
+        rows = await cursor.fetchall()
+        return rows
+
+    async def fetchval(self, sql, *args):
+        row = await self.fetchrow(sql, *args)
+        if row:
+            return row[0]
+        return None
+
+    @staticmethod
+    def row_to_dict(row, columns=None):
+        if row is None:
+            return None
+        return dict(row)
+
+    @staticmethod
+    def rows_to_list(rows):
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def status_matches(result, prefix):
+        if prefix == "UPDATE 0":
+            return result == 0
+        if prefix.startswith("UPDATE"):
+            return result > 0
+        if prefix == "DELETE 0":
+            return result == 0
+        if prefix.startswith("DELETE"):
+            return result > 0
+        if prefix == "INSERT 0":
+            return result == 0
+        if prefix.startswith("INSERT"):
+            return result > 0
+        return False
+
+    @staticmethod
+    def placeholder():
+        return "?"
+
+
+class Database:
+    def __init__(self):
+        self.backend = None
+        self._mode = _detect_db_mode()
+
+    async def connect(self):
+        if self._mode == "postgres":
+            if not _HAS_PG:
+                raise RuntimeError("PostgreSQL mode requires asyncpg. Run: pip install asyncpg")
+            self.backend = _PostgresBackend()
+        else:
+            if not _HAS_SQLITE:
+                raise RuntimeError("SQLite mode requires aiosqlite. Run: pip install aiosqlite")
+            self.backend = _SqliteBackend()
+        await self.backend.connect()
+        await self._init_schema()
+        await self._seed_from_json()
+
+    async def close(self):
+        if self.backend:
+            await self.backend.close()
+
+    async def _init_schema(self):
+        p = self.backend.placeholder()
+        if self._mode == "postgres":
+            await self.backend.execute(f"""
                 CREATE TABLE IF NOT EXISTS users (
                     username TEXT PRIMARY KEY,
                     password_hash TEXT NOT NULL,
@@ -146,7 +297,7 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
-            await conn.execute("""
+            await self.backend.execute(f"""
                 CREATE TABLE IF NOT EXISTS forums (
                     id TEXT PRIMARY KEY,
                     name TEXT NOT NULL,
@@ -154,7 +305,7 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
-            await conn.execute("""
+            await self.backend.execute(f"""
                 CREATE TABLE IF NOT EXISTS topics (
                     id UUID PRIMARY KEY,
                     forum_id TEXT NOT NULL REFERENCES forums(id) ON DELETE CASCADE,
@@ -164,7 +315,7 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
-            await conn.execute("""
+            await self.backend.execute(f"""
                 CREATE TABLE IF NOT EXISTS posts (
                     id UUID PRIMARY KEY,
                     topic_id UUID NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
@@ -173,13 +324,13 @@ class Database:
                     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
                 )
             """)
-            await conn.execute("""
+            await self.backend.execute(f"""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
                 )
             """)
-            await conn.execute("""
+            await self.backend.execute(f"""
                 CREATE TABLE IF NOT EXISTS dms (
                     id UUID PRIMARY KEY,
                     sender TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
@@ -189,38 +340,108 @@ class Database:
                     read BOOLEAN NOT NULL DEFAULT FALSE
                 )
             """)
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_recipient ON dms(recipient, read)")
-            await conn.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
-            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
-            await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
-            await conn.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS slug TEXT")
-            # Assign slugs to existing topics that don't have one yet
-            slugless = await conn.fetch("SELECT id FROM topics WHERE slug IS NULL OR slug = ''")
-            for row in slugless:
-                await conn.execute("UPDATE topics SET slug = $1 WHERE id = $2", secrets.token_hex(12), row["id"])
+            await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_recipient ON dms(recipient, read)")
+            await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
+            await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
+            await self.backend.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
+            await self.backend.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS slug TEXT")
+            slugless = await self.backend.fetch(f"SELECT id FROM topics WHERE slug IS NULL OR slug = ''")
+            for row in self.backend.rows_to_list(slugless):
+                await self.backend.execute(f"UPDATE topics SET slug = {p}1 WHERE id = {p}2", secrets.token_hex(12), row["id"])
             if slugless:
                 print(f"Assigned slugs to {len(slugless)} existing topics")
-            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMPTZ")
-            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
-            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT ''")
-            await conn.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS music_prefs TEXT NOT NULL DEFAULT '{}'")
-            await conn.execute("UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
-            await conn.execute("INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
-
-            bot = await conn.fetchrow("SELECT username FROM users WHERE username = $1", BOT_USERNAME)
+            await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ban_until TIMESTAMPTZ")
+            await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
+            await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT ''")
+            await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS music_prefs TEXT NOT NULL DEFAULT '{}'")
+            await self.backend.execute(f"UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
+            await self.backend.execute(f"INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
+            bot = await self.backend.fetchrow(f"SELECT username FROM users WHERE username = {p}1", BOT_USERNAME)
             if not bot:
                 random_hash = hashlib.sha256((str(uuid.uuid4()) * 8).encode()).hexdigest()
-                await conn.execute(
-                    "INSERT INTO users (username, password_hash, is_admin, super_admin, banned, is_bot) VALUES ($1, $2, TRUE, FALSE, FALSE, TRUE)",
+                await self.backend.execute(
+                    f"INSERT INTO users (username, password_hash, is_admin, super_admin, banned, is_bot) VALUES ({p}1, {p}2, TRUE, FALSE, FALSE, TRUE)",
+                    BOT_USERNAME, random_hash
+                )
+        else:
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    username TEXT PRIMARY KEY,
+                    password_hash TEXT NOT NULL,
+                    is_admin INTEGER NOT NULL DEFAULT 0,
+                    super_admin INTEGER NOT NULL DEFAULT 0,
+                    banned INTEGER NOT NULL DEFAULT 0,
+                    ban_reason TEXT,
+                    ban_duration TEXT,
+                    ban_until TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    is_bot INTEGER NOT NULL DEFAULT 0,
+                    signature TEXT NOT NULL DEFAULT '',
+                    music_prefs TEXT NOT NULL DEFAULT '{}'
+                )
+            """)
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS forums (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    description TEXT NOT NULL DEFAULT '',
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS topics (
+                    id TEXT PRIMARY KEY,
+                    forum_id TEXT NOT NULL REFERENCES forums(id) ON DELETE CASCADE,
+                    title TEXT NOT NULL,
+                    author TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    closed INTEGER NOT NULL DEFAULT 0,
+                    admin_only INTEGER NOT NULL DEFAULT 0,
+                    slug TEXT,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS posts (
+                    id TEXT PRIMARY KEY,
+                    topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+                    author TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
+            """)
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS dms (
+                    id TEXT PRIMARY KEY,
+                    sender TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    recipient TEXT NOT NULL REFERENCES users(username) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+                    read INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_recipient ON dms(recipient, read)")
+            await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
+            await self.backend.execute(f"UPDATE users SET super_admin = 1 WHERE username = 'christmas_child' AND super_admin = 0")
+            await self.backend.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!')")
+            bot = await self.backend.fetchrow(f"SELECT username FROM users WHERE username = ?", BOT_USERNAME)
+            if not bot:
+                random_hash = hashlib.sha256((str(uuid.uuid4()) * 8).encode()).hexdigest()
+                await self.backend.execute(
+                    "INSERT INTO users (username, password_hash, is_admin, super_admin, banned, is_bot) VALUES (?, ?, 1, 0, 0, 1)",
                     BOT_USERNAME, random_hash
                 )
         print("Database schema initialized")
 
     async def _seed_from_json(self):
-        async with self.pool.acquire() as conn:
-            forum_count = await conn.fetchval("SELECT COUNT(*) FROM forums")
-            if forum_count > 0:
-                return
+        count = await self.backend.fetchval("SELECT COUNT(*) FROM forums")
+        if count and count > 0:
+            return
 
         users_data = _read_json(USERS_FILE)
         forums_data = _read_json(FORUMS_FILE)
@@ -237,46 +458,92 @@ class Database:
                     pass
             return now
 
-        async with self.pool.acquire() as conn:
-            for username, user in users_data.items():
-                await conn.execute(
-                    "INSERT INTO users (username, password_hash, is_admin, super_admin, banned, ban_reason, ban_duration, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT DO NOTHING",
+        p = self.backend.placeholder()
+
+        for username, user in users_data.items():
+            banned = 1 if user.get("banned") else 0
+            is_admin = 1 if user.get("is_admin") else 0
+            super_admin = 1 if user.get("super_admin") else 0
+            if self._mode == "sqlite":
+                await self.backend.execute(
+                    f"INSERT OR IGNORE INTO users (username, password_hash, is_admin, super_admin, banned, ban_reason, ban_duration, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5, {p}6, {p}7, {p}8)",
+                    username, user["password"], is_admin, super_admin, banned,
+                    user.get("ban_reason"), user.get("ban_duration"),
+                    _parse_dt(user.get("created_at")).isoformat()
+                )
+            else:
+                await self.backend.execute(
+                    f"INSERT INTO users (username, password_hash, is_admin, super_admin, banned, ban_reason, ban_duration, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5, {p}6, {p}7, {p}8) ON CONFLICT DO NOTHING",
                     username, user["password"], user.get("is_admin", False), user.get("super_admin", False), user.get("banned", False),
                     user.get("ban_reason"), user.get("ban_duration"),
                     _parse_dt(user.get("created_at"))
                 )
 
-            if forums_data:
-                for fid, forum in forums_data.items():
-                    await conn.execute(
-                        "INSERT INTO forums (id, name, description, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        if forums_data:
+            for fid, forum in forums_data.items():
+                if self._mode == "sqlite":
+                    await self.backend.execute(
+                        f"INSERT OR IGNORE INTO forums (id, name, description, created_at) VALUES ({p}1, {p}2, {p}3, {p}4)",
+                        fid, forum["name"], forum.get("description", ""),
+                        _parse_dt(forum.get("created_at")).isoformat()
+                    )
+                else:
+                    await self.backend.execute(
+                        f"INSERT INTO forums (id, name, description, created_at) VALUES ({p}1, {p}2, {p}3, {p}4) ON CONFLICT DO NOTHING",
                         fid, forum["name"], forum.get("description", ""),
                         _parse_dt(forum.get("created_at"))
                     )
-            else:
-                for forum in DEFAULT_FORUMS:
-                    await conn.execute(
-                        "INSERT INTO forums (id, name, description, created_at) VALUES ($1, $2, $3, $4) ON CONFLICT DO NOTHING",
+        else:
+            for forum in DEFAULT_FORUMS:
+                if self._mode == "sqlite":
+                    await self.backend.execute(
+                        f"INSERT OR IGNORE INTO forums (id, name, description, created_at) VALUES ({p}1, {p}2, {p}3, {p}4)",
+                        forum["id"], forum["name"], forum["description"], now.isoformat()
+                    )
+                else:
+                    await self.backend.execute(
+                        f"INSERT INTO forums (id, name, description, created_at) VALUES ({p}1, {p}2, {p}3, {p}4) ON CONFLICT DO NOTHING",
                         forum["id"], forum["name"], forum["description"], now
                     )
 
-            for tid, topic in topics_data.items():
-                await conn.execute(
-                    "INSERT INTO topics (id, forum_id, title, author, closed, created_at) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING",
+        for tid, topic in topics_data.items():
+            closed = 1 if topic.get("closed") else 0
+            if self._mode == "sqlite":
+                await self.backend.execute(
+                    f"INSERT OR IGNORE INTO topics (id, forum_id, title, author, closed, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5, {p}6)",
+                    tid, topic["forum_id"], topic["title"], topic["author"],
+                    closed, _parse_dt(topic.get("created_at")).isoformat()
+                )
+            else:
+                await self.backend.execute(
+                    f"INSERT INTO topics (id, forum_id, title, author, closed, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5, {p}6) ON CONFLICT DO NOTHING",
                     tid, topic["forum_id"], topic["title"], topic["author"],
                     topic.get("closed", False), _parse_dt(topic.get("created_at"))
                 )
 
-            for pid, post in posts_data.items():
-                await conn.execute(
-                    "INSERT INTO posts (id, topic_id, author, content, created_at) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        for pid, post in posts_data.items():
+            if self._mode == "sqlite":
+                await self.backend.execute(
+                    f"INSERT OR IGNORE INTO posts (id, topic_id, author, content, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5)",
+                    pid, post["topic_id"], post["author"], post["content"],
+                    _parse_dt(post.get("created_at")).isoformat()
+                )
+            else:
+                await self.backend.execute(
+                    f"INSERT INTO posts (id, topic_id, author, content, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5) ON CONFLICT DO NOTHING",
                     pid, post["topic_id"], post["author"], post["content"],
                     _parse_dt(post.get("created_at"))
                 )
 
-            await conn.execute(
-                "INSERT INTO settings (key, value) VALUES ('motd', $1) ON CONFLICT DO NOTHING",
+        if self._mode == "sqlite":
+            await self.backend.execute(
+                "INSERT OR IGNORE INTO settings (key, value) VALUES ('motd', ?)",
                 "Welcome to Chatwisp!"
+            )
+        else:
+            await self.backend.execute(
+                "INSERT INTO settings (key, value) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                "motd", "Welcome to Chatwisp!"
             )
 
         print("Database seeded from JSON files")
@@ -308,55 +575,63 @@ class Database:
         return total if total > 0 else None
 
     async def get_user(self, username):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM users WHERE username = $1", username)
-            if row:
-                return {
-                    "username": row["username"],
-                    "password": row["password_hash"],
-                    "is_admin": row["is_admin"],
-                    "super_admin": row["super_admin"],
-                    "banned": row["banned"],
-                    "ban_reason": row["ban_reason"],
-                    "ban_duration": row["ban_duration"],
-                    "ban_until": row["ban_until"],
-                    "is_bot": row["is_bot"],
-                    "signature": row["signature"] or "",
-                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                }
-            return None
+        p = self.backend.placeholder()
+        row = await self.backend.fetchrow(f"SELECT * FROM users WHERE username = {p}1", username)
+        row = self.backend.row_to_dict(row)
+        if row:
+            created = row.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            return {
+                "username": row["username"],
+                "password": row["password_hash"],
+                "is_admin": bool(row["is_admin"]) if self._mode == "sqlite" else row["is_admin"],
+                "super_admin": bool(row["super_admin"]) if self._mode == "sqlite" else row["super_admin"],
+                "banned": bool(row["banned"]) if self._mode == "sqlite" else row["banned"],
+                "ban_reason": row["ban_reason"],
+                "ban_duration": row["ban_duration"],
+                "ban_until": row.get("ban_until"),
+                "is_bot": bool(row.get("is_bot", False)) if self._mode == "sqlite" else row.get("is_bot", False),
+                "signature": row.get("signature") or "",
+                "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            }
+        return None
 
     async def create_user(self, username, password, is_admin=False, super_admin=False):
+        p = self.backend.placeholder()
         try:
-            async with self.pool.acquire() as conn:
-                await conn.execute(
-                    "INSERT INTO users (username, password_hash, is_admin, super_admin) VALUES ($1, $2, $3, $4)",
-                    username, self._hash(password), is_admin, super_admin
-                )
+            await self.backend.execute(
+                f"INSERT INTO users (username, password_hash, is_admin, super_admin) VALUES ({p}1, {p}2, {p}3, {p}4)",
+                username, self._hash(password), is_admin, super_admin
+            )
             return True
-        except asyncpg.exceptions.UniqueViolationError:
+        except Exception:
             return False
 
     async def set_signature(self, username, signature):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET signature = $1 WHERE username = $2",
-                signature, username
-            )
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"UPDATE users SET signature = {p}1 WHERE username = {p}2",
+            signature, username
+        )
 
     async def get_music_prefs(self, username):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT music_prefs FROM users WHERE username = $1", username)
-            if row and row["music_prefs"]:
-                return json.loads(row["music_prefs"])
-            return {}
+        p = self.backend.placeholder()
+        row = await self.backend.fetchrow(f"SELECT music_prefs FROM users WHERE username = {p}1", username)
+        row = self.backend.row_to_dict(row)
+        if row and row["music_prefs"]:
+            return json.loads(row["music_prefs"])
+        return {}
 
     async def set_music_prefs(self, username, prefs):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET music_prefs = $1 WHERE username = $2",
-                json.dumps(prefs), username
-            )
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"UPDATE users SET music_prefs = {p}1 WHERE username = {p}2",
+            json.dumps(prefs), username
+        )
 
     async def verify_password(self, username, password):
         user = await self.get_user(username)
@@ -366,114 +641,136 @@ class Database:
         if self._is_sha256_hash(stored):
             if hashlib.sha256(password.encode()).hexdigest() == stored:
                 new_hash = Database._hash(password)
-                async with self.pool.acquire() as conn:
-                    await conn.execute(
-                        "UPDATE users SET password_hash = $1 WHERE username = $2",
-                        new_hash, username
-                    )
+                pp = self.backend.placeholder()
+                await self.backend.execute(
+                    f"UPDATE users SET password_hash = {pp}1 WHERE username = {pp}2",
+                    new_hash, username
+                )
                 return True
             return False
         return bcrypt.checkpw(password.encode(), stored.encode())
 
     async def has_admin(self):
-        async with self.pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
-            return count > 0
+        count = await self.backend.fetchval("SELECT COUNT(*) FROM users WHERE is_admin = 1" if self._mode == "sqlite" else "SELECT COUNT(*) FROM users WHERE is_admin = TRUE")
+        return count and count > 0
 
     async def get_forums(self):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT * FROM forums ORDER BY created_at ASC")
-            return [{
+        rows = await self.backend.fetch("SELECT * FROM forums ORDER BY created_at ASC")
+        return [{
+            "id": r["id"],
+            "name": r["name"],
+            "description": r["description"],
+        } for r in self.backend.rows_to_list(rows)]
+
+    async def get_forum(self, forum_id):
+        p = self.backend.placeholder()
+        row = await self.backend.fetchrow(f"SELECT * FROM forums WHERE id = {p}1", forum_id)
+        row = self.backend.row_to_dict(row)
+        if row:
+            return {
                 "id": row["id"],
                 "name": row["name"],
                 "description": row["description"],
-            } for row in rows]
-
-    async def get_forum(self, forum_id):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM forums WHERE id = $1", forum_id)
-            if row:
-                return {
-                    "id": row["id"],
-                    "name": row["name"],
-                    "description": row["description"],
-                }
-            return None
+            }
+        return None
 
     async def create_forum(self, name, description):
         fid = name.lower().replace(" ", "_").replace("/", "_")
         base = fid
         counter = 1
-        async with self.pool.acquire() as conn:
-            while True:
-                existing = await conn.fetchval("SELECT id FROM forums WHERE id = $1", fid)
-                if not existing:
-                    break
-                fid = f"{base}_{counter}"
-                counter += 1
-            await conn.execute(
-                "INSERT INTO forums (id, name, description) VALUES ($1, $2, $3)",
-                fid, name, description
-            )
+        p = self.backend.placeholder()
+        while True:
+            existing = await self.backend.fetchval(f"SELECT id FROM forums WHERE id = {p}1", fid)
+            if not existing:
+                break
+            fid = f"{base}_{counter}"
+            counter += 1
+        await self.backend.execute(
+            f"INSERT INTO forums (id, name, description) VALUES ({p}1, {p}2, {p}3)",
+            fid, name, description
+        )
         return {"id": fid, "name": name, "description": description}
 
     async def get_topics(self, forum_id):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT t.*, (SELECT COUNT(*) FROM posts WHERE topic_id = t.id) as post_count
-                FROM topics t WHERE t.forum_id = $1 ORDER BY t.created_at DESC
-            """, forum_id)
-            return [{
+        p = self.backend.placeholder()
+        rows = await self.backend.fetch(f"""
+            SELECT t.*, (SELECT COUNT(*) FROM posts WHERE topic_id = t.id) as post_count
+            FROM topics t WHERE t.forum_id = {p}1 ORDER BY t.created_at DESC
+        """, forum_id)
+        result = []
+        for row in self.backend.rows_to_list(rows):
+            created = row.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            result.append({
                 "id": str(row["id"]),
                 "title": row["title"],
                 "author": row["author"],
-                "closed": row["closed"],
-                "admin_only": row["admin_only"],
-                "slug": row["slug"],
+                "closed": bool(row["closed"]) if self._mode == "sqlite" else row["closed"],
+                "admin_only": bool(row.get("admin_only", False)) if self._mode == "sqlite" else row.get("admin_only", False),
+                "slug": row.get("slug"),
                 "post_count": row["post_count"],
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            } for row in rows]
+                "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            })
+        return result
 
     async def get_topic(self, topic_id):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM topics WHERE id = $1", topic_id)
-            if row:
-                return {
-                    "id": str(row["id"]),
-                    "forum_id": row["forum_id"],
-                    "title": row["title"],
-                    "author": row["author"],
-                    "closed": row["closed"],
-                    "admin_only": row["admin_only"],
-                    "slug": row["slug"],
-                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                }
-            return None
+        p = self.backend.placeholder()
+        row = await self.backend.fetchrow(f"SELECT * FROM topics WHERE id = {p}1", topic_id)
+        row = self.backend.row_to_dict(row)
+        if row:
+            created = row.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            return {
+                "id": str(row["id"]),
+                "forum_id": row["forum_id"],
+                "title": row["title"],
+                "author": row["author"],
+                "closed": bool(row["closed"]) if self._mode == "sqlite" else row["closed"],
+                "admin_only": bool(row.get("admin_only", False)) if self._mode == "sqlite" else row.get("admin_only", False),
+                "slug": row.get("slug"),
+                "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            }
+        return None
 
     async def get_topic_by_slug(self, slug):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT * FROM topics WHERE slug = $1", slug)
-            if row:
-                return {
-                    "id": str(row["id"]),
-                    "forum_id": row["forum_id"],
-                    "title": row["title"],
-                    "author": row["author"],
-                    "closed": row["closed"],
-                    "admin_only": row["admin_only"],
-                    "slug": row["slug"],
-                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-                }
-            return None
+        p = self.backend.placeholder()
+        row = await self.backend.fetchrow(f"SELECT * FROM topics WHERE slug = {p}1", slug)
+        row = self.backend.row_to_dict(row)
+        if row:
+            created = row.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            return {
+                "id": str(row["id"]),
+                "forum_id": row["forum_id"],
+                "title": row["title"],
+                "author": row["author"],
+                "closed": bool(row["closed"]) if self._mode == "sqlite" else row["closed"],
+                "admin_only": bool(row.get("admin_only", False)) if self._mode == "sqlite" else row.get("admin_only", False),
+                "slug": row.get("slug"),
+                "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            }
+        return None
 
     async def create_topic(self, forum_id, title, author, admin_only=False):
         tid = str(uuid.uuid4())
         slug = secrets.token_hex(12)
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO topics (id, forum_id, title, author, admin_only, slug) VALUES ($1, $2, $3, $4, $5, $6)",
-                tid, forum_id, title, author, admin_only, slug
-            )
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"INSERT INTO topics (id, forum_id, title, author, admin_only, slug) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5, {p}6)",
+            tid, forum_id, title, author, admin_only, slug
+        )
         return {
             "id": tid,
             "forum_id": forum_id,
@@ -486,32 +783,41 @@ class Database:
         }
 
     async def close_topic(self, topic_id):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute("UPDATE topics SET closed = TRUE WHERE id = $1", topic_id)
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(f"UPDATE topics SET closed = 1 WHERE id = {p}1" if self._mode == "sqlite" else f"UPDATE topics SET closed = TRUE WHERE id = {p}1", topic_id)
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
     async def reopen_topic(self, topic_id):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute("UPDATE topics SET closed = FALSE WHERE id = $1", topic_id)
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(f"UPDATE topics SET closed = 0 WHERE id = {p}1" if self._mode == "sqlite" else f"UPDATE topics SET closed = FALSE WHERE id = {p}1", topic_id)
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
     async def get_posts(self, topic_id):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("""
-                SELECT p.*, u.signature
-                FROM posts p
-                JOIN users u ON p.author = u.username
-                WHERE p.topic_id = $1
-                ORDER BY p.created_at ASC
-            """, topic_id)
-            return [{
+        p = self.backend.placeholder()
+        rows = await self.backend.fetch(f"""
+            SELECT p.*, u.signature
+            FROM posts p
+            JOIN users u ON p.author = u.username
+            WHERE p.topic_id = {p}1
+            ORDER BY p.created_at ASC
+        """, topic_id)
+        result = []
+        for row in self.backend.rows_to_list(rows):
+            created = row.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            result.append({
                 "id": str(row["id"]),
                 "topic_id": str(row["topic_id"]),
                 "author": row["author"],
                 "content": row["content"],
-                "signature": row["signature"] or "",
-                "created_at": row["created_at"].isoformat() if row["created_at"] else None,
-            } for row in rows]
+                "signature": row.get("signature") or row.get("signature", "") or "",
+                "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            })
+        return result
 
     async def create_post(self, topic_id, author, content):
         topic = await self.get_topic(topic_id)
@@ -520,11 +826,11 @@ class Database:
         if topic["closed"]:
             return None
         pid = str(uuid.uuid4())
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO posts (id, topic_id, author, content) VALUES ($1, $2, $3, $4)",
-                pid, topic_id, author, content
-            )
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"INSERT INTO posts (id, topic_id, author, content) VALUES ({p}1, {p}2, {p}3, {p}4)",
+            pid, topic_id, author, content
+        )
         return {
             "id": pid,
             "topic_id": topic_id,
@@ -534,171 +840,219 @@ class Database:
         }
 
     async def get_all_users(self):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT username, is_admin, super_admin, banned, ban_reason FROM users WHERE is_bot = FALSE ORDER BY username ASC"
-            )
-            return [{
+        rows = await self.backend.fetch(
+            "SELECT username, is_admin, super_admin, banned, ban_reason FROM users WHERE is_bot = 0 ORDER BY username ASC" if self._mode == "sqlite"
+            else "SELECT username, is_admin, super_admin, banned, ban_reason FROM users WHERE is_bot = FALSE ORDER BY username ASC"
+        )
+        result = []
+        for row in self.backend.rows_to_list(rows):
+            result.append({
                 "username": row["username"],
-                "is_admin": row["is_admin"],
-                "super_admin": row["super_admin"],
-                "banned": row["banned"],
+                "is_admin": bool(row["is_admin"]) if self._mode == "sqlite" else row["is_admin"],
+                "super_admin": bool(row["super_admin"]) if self._mode == "sqlite" else row["super_admin"],
+                "banned": bool(row["banned"]) if self._mode == "sqlite" else row["banned"],
                 "ban_reason": row["ban_reason"],
-            } for row in rows]
+            })
+        return result
 
     async def get_all_usernames(self):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch("SELECT username FROM users WHERE is_bot = FALSE")
-            return [r["username"] for r in rows]
+        rows = await self.backend.fetch(
+            "SELECT username FROM users WHERE is_bot = 0 ORDER BY username" if self._mode == "sqlite"
+            else "SELECT username FROM users WHERE is_bot = FALSE ORDER BY username"
+        )
+        return [r["username"] for r in self.backend.rows_to_list(rows)]
 
     async def ban_user(self, username, reason=None, duration=None, ban_until=None):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE users SET banned = TRUE, ban_reason = $2, ban_duration = $3, ban_until = $4 WHERE username = $1",
-                username, reason, duration, ban_until
-            )
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(
+            f"UPDATE users SET banned = 1, ban_reason = {p}2, ban_duration = {p}3, ban_until = {p}4 WHERE username = {p}1" if self._mode == "sqlite"
+            else f"UPDATE users SET banned = TRUE, ban_reason = {p}2, ban_duration = {p}3, ban_until = {p}4 WHERE username = {p}1",
+            username, reason, duration, ban_until
+        )
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
     async def unban_user(self, username):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE users SET banned = FALSE, ban_reason = NULL, ban_duration = NULL, ban_until = NULL WHERE username = $1",
-                username
-            )
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(
+            f"UPDATE users SET banned = 0, ban_reason = NULL, ban_duration = NULL, ban_until = NULL WHERE username = {p}1" if self._mode == "sqlite"
+            else f"UPDATE users SET banned = FALSE, ban_reason = NULL, ban_duration = NULL, ban_until = NULL WHERE username = {p}1",
+            username
+        )
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
     async def delete_user(self, username):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute("DELETE FROM users WHERE username = $1", username)
-            return result != "DELETE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(f"DELETE FROM users WHERE username = {p}1", username)
+        return self.backend.status_matches(result, "DELETE") and not self.backend.status_matches(result, "DELETE 0")
 
     async def promote_to_admin(self, username):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE users SET is_admin = TRUE WHERE username = $1 AND is_admin = FALSE",
-                username
-            )
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(
+            f"UPDATE users SET is_admin = 1 WHERE username = {p}1 AND is_admin = 0" if self._mode == "sqlite"
+            else f"UPDATE users SET is_admin = TRUE WHERE username = {p}1 AND is_admin = FALSE",
+            username
+        )
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
     async def demote_from_admin(self, username):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE users SET is_admin = FALSE WHERE username = $1 AND is_admin = TRUE AND super_admin = FALSE",
-                username
-            )
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(
+            f"UPDATE users SET is_admin = 0 WHERE username = {p}1 AND is_admin = 1 AND super_admin = 0" if self._mode == "sqlite"
+            else f"UPDATE users SET is_admin = FALSE WHERE username = {p}1 AND is_admin = TRUE AND super_admin = FALSE",
+            username
+        )
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
     async def get_motd(self):
-        async with self.pool.acquire() as conn:
-            row = await conn.fetchrow("SELECT value FROM settings WHERE key = 'motd'")
-            if row:
-                return row["value"]
-            return "Welcome to Chatwisp!"
+        row = await self.backend.fetchrow("SELECT value FROM settings WHERE key = 'motd'")
+        row = self.backend.row_to_dict(row)
+        if row:
+            return row["value"]
+        return "Welcome to Chatwisp!"
 
     async def set_motd(self, motd):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO settings (key, value) VALUES ('motd', $1) ON CONFLICT (key) DO UPDATE SET value = $1",
+        p = self.backend.placeholder()
+        if self._mode == "sqlite":
+            await self.backend.execute(
+                "INSERT OR REPLACE INTO settings (key, value) VALUES ('motd', ?)",
+                motd
+            )
+        else:
+            await self.backend.execute(
+                f"INSERT INTO settings (key, value) VALUES ('motd', {p}1) ON CONFLICT (key) DO UPDATE SET value = {p}1",
                 motd
             )
 
     async def search_users(self, query):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                "SELECT username FROM users WHERE username ILIKE $1 AND is_bot = FALSE ORDER BY username ASC LIMIT 20",
-                f"%{query}%"
-            )
-            return [row["username"] for row in rows]
+        p = self.backend.placeholder()
+        rows = await self.backend.fetch(
+            f"SELECT username FROM users WHERE username LIKE {p}1 AND is_bot = 0 ORDER BY username ASC LIMIT 20" if self._mode == "sqlite"
+            else f"SELECT username FROM users WHERE username ILIKE {p}1 AND is_bot = FALSE ORDER BY username ASC LIMIT 20",
+            f"%{query}%"
+        )
+        return [r["username"] for r in self.backend.rows_to_list(rows)]
 
     async def send_dm(self, sender, recipient, content):
         mid = str(uuid.uuid4())
         now = datetime.now()
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "INSERT INTO dms (id, sender, recipient, content, created_at) VALUES ($1, $2, $3, $4, $5)",
-                mid, sender, recipient, content, now
-            )
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"INSERT INTO dms (id, sender, recipient, content, created_at) VALUES ({p}1, {p}2, {p}3, {p}4, {p}5)",
+            mid, sender, recipient, content, now.isoformat() if self._mode == "sqlite" else now
+        )
         return {"id": mid, "sender": sender, "recipient": recipient, "content": content, "created_at": now.isoformat()}
 
     async def get_dm_conversation(self, user_a, user_b, limit=50):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT id, sender, recipient, content, created_at FROM dms
-                   WHERE (sender = $1 AND recipient = $2) OR (sender = $2 AND recipient = $1)
-                   ORDER BY created_at DESC LIMIT $3""",
-                user_a, user_b, limit
-            )
-            result = []
-            for r in reversed(rows):
-                result.append({
-                    "id": str(r["id"]),
-                    "sender": r["sender"],
-                    "recipient": r["recipient"],
-                    "content": r["content"],
-                    "created_at": r["created_at"].isoformat() if r["created_at"] else None,
-                })
-            return result
+        p = self.backend.placeholder()
+        rows = await self.backend.fetch(
+            f"""SELECT id, sender, recipient, content, created_at FROM dms
+               WHERE (sender = {p}1 AND recipient = {p}2) OR (sender = {p}2 AND recipient = {p}1)
+               ORDER BY created_at DESC LIMIT {p}3""",
+            user_a, user_b, limit
+        )
+        result = []
+        for r in reversed(self.backend.rows_to_list(rows)):
+            created = r.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            result.append({
+                "id": str(r["id"]),
+                "sender": r["sender"],
+                "recipient": r["recipient"],
+                "content": r["content"],
+                "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            })
+        return result
 
     async def get_dm_contacts(self, username):
-        async with self.pool.acquire() as conn:
-            rows = await conn.fetch(
-                """SELECT DISTINCT ON (pair) pair, sender, recipient, content, created_at, read FROM (
+        p = self.backend.placeholder()
+        if self._mode == "sqlite":
+            rows = await self.backend.fetch(f"""
+                SELECT sender, recipient, content, created_at, read
+                FROM (
+                    SELECT sender, recipient, content, created_at, read,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY
+                                CASE WHEN sender < recipient THEN sender ELSE recipient END,
+                                CASE WHEN sender > recipient THEN sender ELSE recipient END
+                            ORDER BY created_at DESC
+                        ) as rn
+                    FROM dms
+                    WHERE sender = {p}1 OR recipient = {p}1
+                ) WHERE rn = 1
+                ORDER BY created_at DESC
+            """, username)
+        else:
+            rows = await self.backend.fetch(
+                f"""SELECT DISTINCT ON (pair) pair, sender, recipient, content, created_at, read FROM (
                      SELECT
                        GREATEST(sender, recipient) || ':' || LEAST(sender, recipient) AS pair,
                        sender, recipient, content, created_at, read
                      FROM dms
-                     WHERE sender = $1 OR recipient = $1
+                     WHERE sender = {p}1 OR recipient = {p}1
                      ORDER BY pair, created_at DESC
                    ) sub ORDER BY pair, created_at DESC""",
                 username
             )
-            contacts = []
-            for r in rows:
-                other = r["recipient"] if r["sender"] == username else r["sender"]
-                contacts.append({
-                    "username": other,
-                    "last_message": r["content"],
-                    "last_time": r["created_at"].isoformat() if r["created_at"] else None,
-                })
-            return contacts
+        contacts = []
+        for r in self.backend.rows_to_list(rows):
+            other = r["recipient"] if r["sender"] == username else r["sender"]
+            created = r.get("created_at")
+            if created and isinstance(created, str):
+                try:
+                    created = datetime.fromisoformat(created)
+                except (ValueError, TypeError):
+                    pass
+            contacts.append({
+                "username": other,
+                "last_message": r["content"],
+                "last_time": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
+            })
+        return contacts
 
     async def mark_dms_read(self, recipient, sender):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE dms SET read = TRUE WHERE recipient = $1 AND sender = $2 AND read = FALSE",
-                recipient, sender
-            )
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"UPDATE dms SET read = 1 WHERE recipient = {p}1 AND sender = {p}2 AND read = 0" if self._mode == "sqlite"
+            else f"UPDATE dms SET read = TRUE WHERE recipient = {p}1 AND sender = {p}2 AND read = FALSE",
+            recipient, sender
+        )
 
     async def get_total_unread(self, username):
-        async with self.pool.acquire() as conn:
-            return await conn.fetchval(
-                "SELECT COUNT(*) FROM dms WHERE recipient = $1 AND read = FALSE", username
-            )
+        p = self.backend.placeholder()
+        return await self.backend.fetchval(
+            f"SELECT COUNT(*) FROM dms WHERE recipient = {p}1 AND read = 0" if self._mode == "sqlite"
+            else f"SELECT COUNT(*) FROM dms WHERE recipient = {p}1 AND read = FALSE",
+            username
+        )
 
     async def delete_post(self, post_id):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute("DELETE FROM posts WHERE id = $1", post_id)
-            return result != "DELETE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(f"DELETE FROM posts WHERE id = {p}1", post_id)
+        return self.backend.status_matches(result, "DELETE") and not self.backend.status_matches(result, "DELETE 0")
 
     async def delete_topic(self, topic_id):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute("DELETE FROM topics WHERE id = $1", topic_id)
-            return result != "DELETE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(f"DELETE FROM topics WHERE id = {p}1", topic_id)
+        return self.backend.status_matches(result, "DELETE") and not self.backend.status_matches(result, "DELETE 0")
 
     async def update_password(self, username, new_password):
-        async with self.pool.acquire() as conn:
-            await conn.execute(
-                "UPDATE users SET password_hash = $1 WHERE username = $2",
-                self._hash(new_password), username
-            )
-            return True
+        p = self.backend.placeholder()
+        await self.backend.execute(
+            f"UPDATE users SET password_hash = {p}1 WHERE username = {p}2",
+            self._hash(new_password), username
+        )
+        return True
 
     async def set_topic_admin_only(self, topic_id, value):
-        async with self.pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE topics SET admin_only = $1 WHERE id = $2", value, topic_id
-            )
-            return result != "UPDATE 0"
+        p = self.backend.placeholder()
+        result = await self.backend.execute(
+            f"UPDATE topics SET admin_only = {p}1 WHERE id = {p}2", value, topic_id
+        )
+        return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
 
 class ChatServer:
