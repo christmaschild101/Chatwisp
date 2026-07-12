@@ -25,12 +25,12 @@ git checkout source && git merge main && git push origin source && git checkout 
 ## Running
 
 ```bash
-pip install -r requirements.txt   # websockets>=11.0, asyncpg>=0.28.0, bcrypt>=4.0.0
-python server.py                   # default ws://0.0.0.0:8765 (or $PORT on Render)
+pip install -r requirements.txt   # websockets, asyncpg, bcrypt, aiosqlite
+python server.py                   # uses SQLite (chatwisp.db) — no setup needed
 python server.py --host 0.0.0.0 --port 8765
 ```
 
-Requires a PostgreSQL database. On first run the server reads `server_data/*.json` to seed the database, then uses PostgreSQL for all subsequent operations. Database credentials come from environment variables only (PGHOST, PGUSER, PGPASSWORD, PGPORT, PGDATABASE) or DATABASE_URL.
+By default the server uses SQLite (zero configuration). Set `DATABASE_URL` or PG environment variables to use PostgreSQL instead.
 
 ## Database
 
@@ -41,6 +41,8 @@ postgresql://user:password@host:port/database
 ```
 
 On Render, set `DATABASE_URL` in the Render dashboard Environment Variables section.
+
+If no PostgreSQL environment variables are set, the server uses SQLite with a local `chatwisp.db` file (zero configuration).
 
 On first run, the server creates these tables automatically:
 

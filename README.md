@@ -8,14 +8,19 @@ A real-time chat application with forums, direct messages, and admin management.
 
 ```bash
 pip install -r requirements.txt
-python server.py --host 0.0.0.0 --port 8765
+python server.py
 ```
 
-Requires a PostgreSQL database. On first run the server creates all tables and seeds them from `server_data/*.json`. Database credentials come from `DATABASE_URL`:
+That's it. The server uses SQLite by default — no database server or environment variables needed. A `chatwisp.db` file will be created automatically, and the first admin account is created via WebSocket after the server starts.
+
+For a PostgreSQL-powered server (used by the central deployment), set the `DATABASE_URL` environment variable:
 
 ```bash
 export DATABASE_URL="postgresql://user:password@host:port/database"
+python server.py
 ```
+
+On first run the server creates all tables and seeds them from `server_data/*.json`.
 
 ### First admin account
 
@@ -44,8 +49,9 @@ All configuration comes from environment variables:
 
 | Variable | Purpose |
 |---|---|
-| `DATABASE_URL` | PostgreSQL connection string |
+| `DATABASE_URL` | PostgreSQL connection string (omit for SQLite) |
 | `PGHOST`, `PGUSER`, `PGPASSWORD`, `PGPORT`, `PGDATABASE` | Alternative to DATABASE_URL |
+| `SQLITE_PATH` | Path for SQLite database file (default: `chatwisp.db`) |
 | `PORT` | Port for the WebSocket server (Render sets this automatically) |
 
 ## Features
@@ -72,7 +78,7 @@ The server serves 5 royalty-free MP3s from the `/music/` endpoint. Music was rem
 ## Development
 
 ```bash
-git clone https://github.com/christmas-child/Chatwisp.git
+git clone https://github.com/christmaschild101/Chatwisp.git
 cd Chatwisp
 pip install -r requirements.txt
 python server.py

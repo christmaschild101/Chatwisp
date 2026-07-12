@@ -8,3 +8,4 @@ build/
 *.spec
 client_web/music/
 sounds/
+*.db
