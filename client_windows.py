@@ -152,12 +152,16 @@ class ChatwispFrame(wx.Frame):
         sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
         sz.AddSpacer(15)
 
-        gs = wx.FlexGridSizer(2, 2, 8, 15)
+        gs = wx.FlexGridSizer(3, 2, 8, 15)
         gs.AddGrowableCol(1)
 
         gs.Add(wx.StaticText(pnl, label="Server Address:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
-        self.server_uri = wx.TextCtrl(pnl, value="ws://")
-        gs.Add(self.server_uri, 0, wx.EXPAND | wx.RIGHT, 20)
+        self.server_host = wx.TextCtrl(pnl, value="127.0.0.1")
+        gs.Add(self.server_host, 0, wx.EXPAND | wx.RIGHT, 20)
+
+        gs.Add(wx.StaticText(pnl, label="Port:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
+        self.server_port = wx.TextCtrl(pnl, value="8765")
+        gs.Add(self.server_port, 0, wx.EXPAND | wx.RIGHT, 20)
 
         sz.Add(gs, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 10)
 
@@ -174,14 +178,16 @@ class ChatwispFrame(wx.Frame):
         sz.AddStretchSpacer()
         pnl.SetSizer(sz)
         self.switch_view(pnl)
-        self.server_uri.SetFocus()
-        self.announce("Enter external server address.")
+        self.server_host.SetFocus()
+        self.announce("Enter external server address and port.")
 
     def _on_external_connect(self, event):
-        uri = self.server_uri.GetValue().strip()
-        if not uri:
-            wx.MessageBox("Please enter a server address", "Error", wx.OK | wx.ICON_ERROR)
+        host = self.server_host.GetValue().strip()
+        port = self.server_port.GetValue().strip()
+        if not host or not port:
+            wx.MessageBox("Please enter a server address and port", "Error", wx.OK | wx.ICON_ERROR)
             return
+        uri = f"ws://{host}:{port}"
         self.show_login(uri)
 
     # --- Login View ---
