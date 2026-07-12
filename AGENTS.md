@@ -7,7 +7,7 @@ server.py              # WebSocket server (Python, websockets lib + asyncpg, bcr
 client_windows.py      # Windows desktop client (wxPython)
 client_web/            # Static HTML+CSS+JS web client (no build step)
 client_web/music/      # MP3s served by server at /music/ (gitignored)
-server_data/           # JSON seed files (read once on first database init)
+server_data/           # Local seed data (gitignored; server falls back to DEFAULT_FORUMS)
 site/                  # Download page + Chatwisp.exe for distribution
 ```
 
@@ -54,7 +54,7 @@ On first run, the server creates these tables automatically:
 - **`settings`** — key (text PK), value (text) — stores server config like MOTD
 - **`music_prefs`** column on users table (JSON string, kept for DB compat)
 
-To reset the database: drop the six tables and restart the server — it will re-seed from `server_data/*.json` on the next startup.
+To reset the database: drop the six tables and restart the server — it will re-seed from `server_data/*.json` on the next startup (or fall back to DEFAULT_FORUMS if the JSON files are absent).
 
 ## Clients
 
@@ -85,7 +85,7 @@ Only the first `create_dev_account` WebSocket message succeeds (no prior admin e
 
 ## Resetting state
 
-Drop the six tables (users, forums, topics, posts, dms, settings) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup.
+Drop the six tables (users, forums, topics, posts, dms, settings) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup (or fall back to DEFAULT_FORUMS if the JSON files are absent).
 
 ## Security notes (v3.0.1)
 
