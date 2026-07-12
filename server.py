@@ -1863,7 +1863,11 @@ class ChatServer:
 
         try:
             async with websockets.serve(self.handler, self.host, self.port, process_request=health_check) as server:
-                loop.add_signal_handler(signal.SIGTERM, server.close)
+                if hasattr(signal, "SIGTERM"):
+                    try:
+                        loop.add_signal_handler(signal.SIGTERM, server.close)
+                    except NotImplementedError:
+                        pass
                 await server.wait_closed()
         finally:
             await self.storage.close()
