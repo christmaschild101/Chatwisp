@@ -10,7 +10,7 @@ import time
 import uuid
 import sys
 import bcrypt
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 VERSION = "4.0.0"
 
@@ -1060,10 +1060,10 @@ class Database:
     async def create_voice_channel(self, forum_id, name):
         cid = str(uuid.uuid4())
         p = self.backend.placeholder()
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         await self.backend.execute(
             f"INSERT INTO voice_channels (id, forum_id, name, created_at) VALUES ({p}1, {p}2, {p}3, {p}4)",
-            cid, forum_id, name, now.isoformat() if self._mode == "sqlite" else now
+            cid, forum_id, name, now if self._mode == "postgres" else now.isoformat()
         )
         return {"id": cid, "forum_id": forum_id, "name": name, "created_at": now.isoformat()}
 
@@ -1217,7 +1217,12 @@ class ChatServer:
 
         handler = handlers.get(msg_type)
         if handler:
-            await handler(websocket, data)
+            try:
+                await handler(websocket, data)
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                await self.send(websocket, {"type": "error", "message": f"Server error: {e}"})
         else:
             await self.send(websocket, {"type": "error", "message": "Unknown message type"})
 
@@ -1242,7 +1247,7 @@ class ChatServer:
         if user.get("is_bot"):
             await self.send(websocket, {"type": "login_error", "message": "The Chatwisp Official Account cannot be logged into."})
             return
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if user.get("banned"):
             ban_until = user.get("ban_until")
             reason = user.get("ban_reason") or "No reason given"
@@ -1481,7 +1486,7 @@ class ChatServer:
         if duration:
             seconds = Database._parse_duration(duration)
             if seconds:
-                ban_until = datetime.utcnow() + timedelta(seconds=seconds)
+                ban_until = datetime.now(timezone.utc) + timedelta(seconds=seconds)
         if await self.storage.ban_user(username, reason, duration, ban_until):
             await self.send(websocket, {"type": "banned", "username": username, "message": f"User {username} has been banned"})
             for ws, info in list(self.clients.items()):
@@ -1906,7 +1911,10 @@ class ChatServer:
         name = data.get("name", "").strip()
         if not forum_id or not name:
             return await self.send(websocket, {"type": "error", "message": "forum_id and name required"})
-        channel = await self.storage.create_voice_channel(forum_id, name)
+        try:
+            channel = await self.storage.create_voice_channel(forum_id, name)
+        except Exception as e:
+            return await self.send(websocket, {"type": "error", "message": f"Failed to create voice channel: {e}"})
         await self.send(websocket, {"type": "voice_channel_created", "channel": channel})
 
     async def handle_voice_channels(self, websocket, data):
