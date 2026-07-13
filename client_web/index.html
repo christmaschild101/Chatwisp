@@ -2,7 +2,12 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Chatwisp">
+<link rel="manifest" href="/manifest.json">
+<link rel="apple-touch-icon" href="/icons/icon-192.png">
 <title>Chatwisp - Accessible Forum v4.0.0</title>
 <link rel="stylesheet" href="/style.css">
 </head>
@@ -62,6 +67,25 @@
           <button id="admin-topic-delete-btn" onclick="adminDeleteTopic()" hidden>Delete Topic</button>
           <button id="copy-topic-link-btn" onclick="copyTopicLink()">Copy Topic Link</button>
         </div>
+      </section>
+
+      <section id="voice-section" aria-label="Voice channels" hidden>
+        <h3>Voice Channels</h3>
+        <div id="voice-now" class="voice-now" hidden>
+          <span id="voice-channel-name"></span>
+          <span id="voice-members-list"></span>
+          <div class="btn-group">
+            <button id="voice-leave-btn" onclick="voiceLeave()">Leave</button>
+            <button id="voice-mute-btn" onclick="voiceToggleMute()">Mute</button>
+            <button id="voice-deafen-btn" onclick="voiceToggleDeafen()">Deafen</button>
+          </div>
+        </div>
+        <div id="voice-channel-list" role="list" aria-label="Available voice channels"></div>
+        <div id="voice-create-area" hidden>
+          <input type="text" id="voice-create-name" placeholder="Channel name" maxlength="50">
+          <button onclick="voiceCreate()">Create</button>
+        </div>
+        <button id="voice-show-create-btn" onclick="voiceToggleCreateForm()" hidden>New Voice Channel</button>
       </section>
 
       <section id="forum-section" aria-label="Forums list">

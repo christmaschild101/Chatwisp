@@ -72,6 +72,8 @@ def _read_static(path):
 INDEX_HTML = _read_static("index.html")
 APP_JS = _read_static("app.js")
 STYLE_CSS = _read_static("style.css")
+MANIFEST_JSON = _read_static("manifest.json")
+SW_JS = _read_static("sw.js")
 
 MUSIC_DIR = os.path.join(CLIENT_WEB_DIR, "music")
 AVAILABLE_SONGS = ["ByTheFire", "Frozen-in-Time", "Noisescape", "TranquilReflections", "Wonder"]
@@ -342,6 +344,14 @@ class Database:
             """)
             await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_recipient ON dms(recipient, read)")
             await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
+            await self.backend.execute(f"""
+                CREATE TABLE IF NOT EXISTS voice_channels (
+                    id TEXT PRIMARY KEY,
+                    forum_id TEXT NOT NULL REFERENCES forums(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
             await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS super_admin BOOLEAN NOT NULL DEFAULT FALSE")
             await self.backend.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS admin_only BOOLEAN NOT NULL DEFAULT FALSE")
             await self.backend.execute("ALTER TABLE topics ADD COLUMN IF NOT EXISTS slug TEXT")
@@ -427,6 +437,14 @@ class Database:
             """)
             await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_recipient ON dms(recipient, read)")
             await self.backend.execute("CREATE INDEX IF NOT EXISTS idx_dms_pair ON dms(sender, recipient)")
+            await self.backend.execute("""
+                CREATE TABLE IF NOT EXISTS voice_channels (
+                    id TEXT PRIMARY KEY,
+                    forum_id TEXT NOT NULL REFERENCES forums(id) ON DELETE CASCADE,
+                    name TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                )
+            """)
             await self.backend.execute(f"UPDATE users SET super_admin = 1 WHERE username = 'christmas_child' AND super_admin = 0")
             await self.backend.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!')")
             bot = await self.backend.fetchrow(f"SELECT username FROM users WHERE username = ?", BOT_USERNAME)
@@ -1039,6 +1057,29 @@ class Database:
         result = await self.backend.execute(f"DELETE FROM topics WHERE id = {p}1", topic_id)
         return self.backend.status_matches(result, "DELETE") and not self.backend.status_matches(result, "DELETE 0")
 
+    async def create_voice_channel(self, forum_id, name):
+        cid = str(uuid.uuid4())
+        p = self.backend.placeholder()
+        now = datetime.now()
+        await self.backend.execute(
+            f"INSERT INTO voice_channels (id, forum_id, name, created_at) VALUES ({p}1, {p}2, {p}3, {p}4)",
+            cid, forum_id, name, now.isoformat() if self._mode == "sqlite" else now
+        )
+        return {"id": cid, "forum_id": forum_id, "name": name, "created_at": now.isoformat()}
+
+    async def get_voice_channels(self, forum_id):
+        p = self.backend.placeholder()
+        rows = await self.backend.fetch(
+            f"SELECT id, forum_id, name, created_at FROM voice_channels WHERE forum_id = {p}1 ORDER BY created_at ASC",
+            forum_id
+        )
+        return [dict(r) for r in self.backend.rows_to_list(rows)]
+
+    async def delete_voice_channel(self, channel_id):
+        p = self.backend.placeholder()
+        result = await self.backend.execute(f"DELETE FROM voice_channels WHERE id = {p}1", channel_id)
+        return self.backend.status_matches(result, "DELETE") and not self.backend.status_matches(result, "DELETE 0")
+
     async def update_password(self, username, new_password):
         p = self.backend.placeholder()
         await self.backend.execute(
@@ -1062,6 +1103,9 @@ class ChatServer:
         self.storage = Database()
         self.clients = {}
         self._login_attempts = {}
+        self.voice_members = {}
+        self.voice_states = {}
+        self._voice_signal_counts = {}
 
     async def send(self, websocket, data):
         try:
@@ -1162,6 +1206,13 @@ class ChatServer:
             "get_music_prefs": self.handle_get_music_prefs,
             "set_music_prefs": self.handle_set_music_prefs,
             "resolve_topic_link": self.handle_resolve_topic_link,
+            "voice_create": self.handle_voice_create,
+            "voice_channels": self.handle_voice_channels,
+            "voice_join": self.handle_voice_join,
+            "voice_leave": self.handle_voice_leave,
+            "voice_signal": self.handle_voice_signal,
+            "voice_mute": self.handle_voice_mute,
+            "voice_deafen": self.handle_voice_deafen,
         }
 
         handler = handlers.get(msg_type)
@@ -1816,16 +1867,153 @@ class ChatServer:
         })
 
     async def handle_ping(self, websocket, data):
-        if not self.require_auth(websocket):
-            return
         client_time = data.get("client_time", 0)
         await self.send(websocket, {"type": "pong", "client_time": client_time, "server_time": time.time()})
 
     async def handle_server_info(self, websocket, data):
-        if not self.require_auth(websocket):
-            return
         uptime = int(time.time() - SERVER_START_TIME)
         await self.send(websocket, {"type": "server_info", "uptime": uptime})
+
+    async def _broadcast_voice(self, channel_id, msg, exclude=None):
+        members = self.voice_members.get(channel_id, {})
+        for username, ws in list(members.items()):
+            if ws is exclude:
+                continue
+            if ws in self.clients:
+                await self.send(ws, msg)
+
+    def _leave_voice(self, websocket):
+        state = self.voice_states.pop(websocket, None)
+        if state and state.get("channel_id"):
+            cid = state["channel_id"]
+            username = state.get("username")
+            members = self.voice_members.get(cid)
+            if members:
+                members.pop(username, None)
+                if not members:
+                    self.voice_members.pop(cid, None)
+            if username:
+                asyncio.ensure_future(self._broadcast_voice(cid, {
+                    "type": "voice_user_left",
+                    "channel_id": cid,
+                    "username": username,
+                }))
+
+    async def handle_voice_create(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        forum_id = data.get("forum_id", "").strip()
+        name = data.get("name", "").strip()
+        if not forum_id or not name:
+            return await self.send(websocket, {"type": "error", "message": "forum_id and name required"})
+        channel = await self.storage.create_voice_channel(forum_id, name)
+        await self.send(websocket, {"type": "voice_channel_created", "channel": channel})
+
+    async def handle_voice_channels(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        forum_id = data.get("forum_id", "").strip()
+        if not forum_id:
+            return await self.send(websocket, {"type": "error", "message": "forum_id required"})
+        channels = await self.storage.get_voice_channels(forum_id)
+        enriched = []
+        for ch in channels:
+            member_count = len(self.voice_members.get(ch["id"], {}))
+            enriched.append({**ch, "member_count": member_count})
+        await self.send(websocket, {"type": "voice_channels_list", "forum_id": forum_id, "channels": enriched})
+
+    async def handle_voice_join(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        username = self.clients[websocket]["username"]
+        self._leave_voice(websocket)
+        channel_id = data.get("channel_id", "").strip()
+        if not channel_id:
+            return await self.send(websocket, {"type": "error", "message": "channel_id required"})
+        p = self.storage.backend.placeholder()
+        row = await self.storage.backend.fetchrow(
+            f"SELECT id, forum_id, name, created_at FROM voice_channels WHERE id = {p}1", channel_id
+        )
+        if not row:
+            return await self.send(websocket, {"type": "error", "message": "Channel not found"})
+        channel = dict(row)
+        if channel_id not in self.voice_members:
+            self.voice_members[channel_id] = {}
+        self.voice_members[channel_id][username] = websocket
+        self.voice_states[websocket] = {"channel_id": channel_id, "username": username, "muted": False, "deafened": False}
+        members = list(self.voice_members[channel_id].keys())
+        await self.send(websocket, {"type": "voice_joined", "channel_id": channel_id, "members": members})
+        await self._broadcast_voice(channel_id, {
+            "type": "voice_user_joined",
+            "channel_id": channel_id,
+            "username": username,
+            "members": members,
+        }, exclude=websocket)
+
+    async def handle_voice_leave(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        self._leave_voice(websocket)
+        await self.send(websocket, {"type": "voice_left"})
+
+    async def handle_voice_signal(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        now = time.time()
+        timestamps = self._voice_signal_counts.get(websocket, [])
+        timestamps = [t for t in timestamps if now - t < 1.0]
+        if len(timestamps) >= 20:
+            return
+        timestamps.append(now)
+        self._voice_signal_counts[websocket] = timestamps
+        target = data.get("target", "").strip()
+        signal_type = data.get("signal_type", "")
+        payload = data.get("payload", {})
+        channel_id = data.get("channel_id", "")
+        if not target or not signal_type:
+            return
+        members = self.voice_members.get(channel_id, {})
+        target_ws = members.get(target)
+        if target_ws and target_ws in self.clients:
+            await self.send(target_ws, {
+                "type": "voice_signal",
+                "from": self.clients[websocket]["username"],
+                "signal_type": signal_type,
+                "payload": payload,
+                "channel_id": channel_id,
+            })
+
+    async def handle_voice_mute(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        state = self.voice_states.get(websocket)
+        if not state:
+            return await self.send(websocket, {"type": "error", "message": "Not in a voice channel"})
+        muted = data.get("muted", not state["muted"])
+        state["muted"] = muted
+        channel_id = state["channel_id"]
+        username = state["username"]
+        await self._broadcast_voice(channel_id, {
+            "type": "voice_user_muted" if muted else "voice_user_unmuted",
+            "channel_id": channel_id,
+            "username": username,
+        }, exclude=websocket)
+
+    async def handle_voice_deafen(self, websocket, data):
+        if not self.require_auth(websocket):
+            return await self.send(websocket, {"type": "error", "message": "Not authenticated"})
+        state = self.voice_states.get(websocket)
+        if not state:
+            return await self.send(websocket, {"type": "error", "message": "Not in a voice channel"})
+        deafened = data.get("deafened", not state["deafened"])
+        state["deafened"] = deafened
+        channel_id = state["channel_id"]
+        username = state["username"]
+        await self._broadcast_voice(channel_id, {
+            "type": "voice_user_deafened" if deafened else "voice_user_undeafened",
+            "channel_id": channel_id,
+            "username": username,
+        }, exclude=websocket)
 
     async def handler(self, websocket):
         try:
@@ -1835,6 +2023,7 @@ class ChatServer:
             pass
         finally:
             self.clients.pop(websocket, None)
+            self._leave_voice(websocket)
 
     async def start(self):
         await self.storage.connect()
@@ -1852,6 +2041,18 @@ class ChatServer:
                 return Response(200, "OK", Headers({"Content-Type": "application/javascript; charset=utf-8"}), APP_JS.encode("utf-8"))
             if request.path == "/style.css" and STYLE_CSS is not None:
                 return Response(200, "OK", Headers({"Content-Type": "text/css; charset=utf-8"}), STYLE_CSS.encode("utf-8"))
+            if request.path == "/manifest.json" and MANIFEST_JSON is not None:
+                return Response(200, "OK", Headers({"Content-Type": "application/manifest+json; charset=utf-8"}), MANIFEST_JSON.encode("utf-8"))
+            if request.path == "/sw.js" and SW_JS is not None:
+                return Response(200, "OK", Headers({"Content-Type": "application/javascript; charset=utf-8"}), SW_JS.encode("utf-8"))
+            if request.path.startswith("/icons/") and request.path.count("/") == 2:
+                filename = request.path.split("/")[-1]
+                filepath = os.path.join(CLIENT_WEB_DIR, "icons", filename)
+                if os.path.isfile(filepath):
+                    with open(filepath, "rb") as f:
+                        content_type = "image/png" if filename.endswith(".png") else "application/octet-stream"
+                        return Response(200, "OK", Headers({"Content-Type": content_type}), f.read())
+                return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"File not found\n")
             if request.path.startswith("/forums/") and INDEX_HTML is not None:
                 return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), INDEX_HTML.encode("utf-8"))
             if request.path.startswith("/music/") and request.path.count("/") == 2:
@@ -1867,7 +2068,11 @@ class ChatServer:
 
         try:
             async with websockets.serve(self.handler, self.host, self.port, process_request=health_check) as server:
-                loop.add_signal_handler(signal.SIGTERM, server.close)
+                if hasattr(signal, "SIGTERM"):
+                    try:
+                        loop.add_signal_handler(signal.SIGTERM, server.close)
+                    except NotImplementedError:
+                        pass
                 await server.wait_closed()
         finally:
             await self.storage.close()

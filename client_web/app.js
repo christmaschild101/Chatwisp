@@ -23,7 +23,27 @@ let reconnectAttempts = 0;
 const maxReconnectAttempts = 20;
 let keepaliveInterval = null;
 
+// Voice chat state
+let voiceChannels = [];
+let voiceCurrentChannel = null;
+let voiceCurrentMembers = [];
+let voiceMuted = false;
+let voiceDeafened = false;
+let voiceLocalStream = null;
+let voicePeerConnections = {};
+let voiceJoined = false;
+
+const VOICE_STUN = 'stun:stun.l.google.com:19302';
+
 function $(id) { return document.getElementById(id); }
+
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('sw.js').catch(function(e) {
+      console.warn('SW registration failed:', e);
+    });
+  });
+}
 
 function announce(msg) {
   const status = $('status-bar');
@@ -290,6 +310,45 @@ function handleServerMessage(data) {
     sendMsg({ type: 'get_topics', forum_id: forumId });
     currentTopicId = topicId;
     pendingLinkTopicId = topicId;
+  } else if (type === 'voice_channels_list') {
+    voiceChannels = data.channels || [];
+    renderVoiceChannels(data.forum_id);
+  } else if (type === 'voice_channel_created') {
+    if (data.channel && data.channel.forum_id === currentForumId) {
+      sendMsg({ type: 'voice_channels', forum_id: currentForumId });
+    }
+  } else if (type === 'voice_joined') {
+    voiceJoined = true;
+    voiceCurrentChannel = data.channel_id;
+    voiceCurrentMembers = data.members || [];
+    voiceShowActiveChannel();
+    voiceInitWebRTC();
+  } else if (type === 'voice_left') {
+    voiceCleanup();
+  } else if (type === 'voice_user_joined') {
+    if (voiceJoined && data.channel_id === voiceCurrentChannel) {
+      voiceCurrentMembers = data.members || [];
+      voiceShowActiveChannel();
+      voiceConnectToPeer(data.username);
+    }
+  } else if (type === 'voice_user_left') {
+    if (voiceJoined && data.channel_id === voiceCurrentChannel) {
+      voiceCurrentMembers = data.members || [];
+      voiceShowActiveChannel();
+      voiceRemovePeer(data.username);
+    }
+  } else if (type === 'voice_signal') {
+    voiceHandleSignal(data.from, data.signal_type, data.payload);
+  } else if (type === 'voice_user_muted' || type === 'voice_user_unmuted') {
+    if (voiceJoined && data.channel_id === voiceCurrentChannel) {
+      const el = document.getElementById('voice-peer-' + data.username);
+      if (el) el.className = type === 'voice_user_muted' ? 'voice-muted' : '';
+    }
+  } else if (type === 'voice_user_deafened' || type === 'voice_user_undeafened') {
+    if (voiceJoined && data.channel_id === voiceCurrentChannel) {
+      const el = document.getElementById('voice-peer-' + data.username);
+      if (el) el.className = type === 'voice_user_deafened' ? 'voice-deafened' : '';
+    }
   } else if (type === 'error') {
     announce('Error: ' + data.message);
     alert('Error: ' + data.message);
@@ -345,8 +404,10 @@ function disconnect() {
 }
 
 function showMainMenu() {
+  if (voiceJoined) voiceCleanup();
   showView('view-main');
   hideAllSections();
+  $('voice-section').hidden = true;
   $('forum-section').hidden = false;
   $('admin-controls').hidden = !isAdmin;
   $('section-title').textContent = 'Select Forum';
@@ -381,16 +442,7 @@ function renderForums(forums) {
   }
 }
 
-function selectForum(forumId) {
-  currentForumId = forumId;
-  hideAllSections();
-  $('top-controls').hidden = false;
-  $('topic-section').hidden = false;
-  $('forum-section').hidden = false;
-  $('section-title').textContent = 'Topics';
-  announce('Loading topics...');
-  sendMsg({ type: 'get_topics', forum_id: forumId });
-}
+
 
 // --- Topics ---
 
@@ -775,6 +827,7 @@ function userAction(user) {
 // --- Private Messages ---
 
 function showDmList() {
+  if (voiceJoined) voiceCleanup();
   showView('view-dm-list');
   announce('Loading conversations...');
   sendMsg({ type: 'get_dm_contacts' });
@@ -966,6 +1019,7 @@ function botCreateTopic() {
 }
 
 function showSettings() {
+  if (voiceJoined) voiceCleanup();
   showView('view-settings');
   sendMsg({ type: 'get_signature' });
   $('sig-input').focus();
@@ -994,6 +1048,276 @@ function continueInBrowser() {
   announce('Log in to go directly to the topic');
 }
 
+
+// --- Voice Chat ---
+
+function selectForum(forumId) {
+  currentForumId = forumId;
+  hideAllSections();
+  $('top-controls').hidden = false;
+  $('topic-section').hidden = false;
+  $('forum-section').hidden = false;
+  $('section-title').textContent = 'Topics';
+  $('voice-section').hidden = false;
+  announce('Loading topics...');
+  sendMsg({ type: 'get_topics', forum_id: forumId });
+  sendMsg({ type: 'voice_channels', forum_id: forumId });
+}
+
+function renderVoiceChannels(forumId) {
+  const list = $('voice-channel-list');
+  list.innerHTML = '';
+  voiceChannels.forEach(function(ch) {
+    const div = document.createElement('div');
+    div.className = 'voice-channel-item';
+    div.setAttribute('role', 'listitem');
+    div.setAttribute('tabindex', '0');
+    const count = ch.member_count || 0;
+    div.innerHTML = '<span class="voice-channel-name">🔊 ' + escapeHtml(ch.name) + '</span><span class="voice-channel-count">' + count + ' online</span>';
+    div.addEventListener('click', function() { voiceJoin(ch.id); });
+    div.addEventListener('keydown', function(e) {
+      if (e.key === 'Enter') { voiceJoin(ch.id); }
+    });
+    list.appendChild(div);
+  });
+  $('voice-show-create-btn').hidden = !isAdmin;
+  if (voiceJoined) {
+    voiceShowActiveChannel();
+  } else {
+    $('voice-now').hidden = true;
+  }
+}
+
+function voiceToggleCreateForm() {
+  const area = $('voice-create-area');
+  area.hidden = !area.hidden;
+  if (!area.hidden) {
+    $('voice-create-name').focus();
+  }
+}
+
+function voiceCreate() {
+  const name = $('voice-create-name').value.trim();
+  if (!name) return;
+  sendMsg({ type: 'voice_create', forum_id: currentForumId, name: name });
+  $('voice-create-name').value = '';
+  $('voice-create-area').hidden = true;
+}
+
+function voiceJoin(channelId) {
+  if (voiceJoined) {
+    voiceLeave();
+  }
+  sendMsg({ type: 'voice_join', channel_id: channelId });
+}
+
+function voiceLeave() {
+  voiceCleanup();
+  sendMsg({ type: 'voice_leave' });
+}
+
+function voiceToggleMute() {
+  voiceMuted = !voiceMuted;
+  if (voiceLocalStream) {
+    voiceLocalStream.getAudioTracks().forEach(function(t) {
+      t.enabled = !voiceMuted;
+    });
+  }
+  sendMsg({ type: 'voice_mute', muted: voiceMuted });
+  $('voice-mute-btn').textContent = voiceMuted ? 'Unmute' : 'Mute';
+}
+
+function voiceToggleDeafen() {
+  voiceDeafened = !voiceDeafened;
+  Object.keys(voicePeerConnections).forEach(function(p) {
+    var audio = document.getElementById('voice-audio-' + p);
+    if (audio) audio.muted = voiceDeafened;
+  });
+  sendMsg({ type: 'voice_deafen', deafened: voiceDeafened });
+  $('voice-deafen-btn').textContent = voiceDeafened ? 'Undeafen' : 'Deafen';
+}
+
+function voiceShowActiveChannel() {
+  const ch = voiceChannels.find(function(c) { return c.id === voiceCurrentChannel; });
+  $('voice-channel-name').textContent = '🔊 In: ' + (ch ? ch.name : 'Voice');
+  $('voice-members-list').textContent = voiceCurrentMembers.length ? voiceCurrentMembers.join(', ') : '';
+  $('voice-now').hidden = false;
+}
+
+function voiceInitWebRTC() {
+  if (voiceLocalStream) return;
+  navigator.mediaDevices.getUserMedia({ audio: true }).then(function(stream) {
+    voiceLocalStream = stream;
+    voiceCurrentMembers.forEach(function(m) {
+      if (m !== username) {
+        voiceConnectToPeer(m);
+      }
+    });
+  }).catch(function(e) {
+    announce('Mic access denied: ' + e.message);
+  });
+}
+
+function voiceConnectToPeer(target) {
+  if (voicePeerConnections[target]) return;
+  if (!voiceLocalStream) return;
+
+  var cfg = { iceServers: [{ urls: VOICE_STUN }] };
+  var pc = new RTCPeerConnection(cfg);
+
+  voicePeerConnections[target] = pc;
+
+  voiceLocalStream.getTracks().forEach(function(t) {
+    pc.addTrack(t, voiceLocalStream);
+  });
+
+  pc.onicecandidate = function(e) {
+    if (e.candidate) {
+      sendMsg({
+        type: 'voice_signal',
+        target: target,
+        signal_type: 'ice',
+        channel_id: voiceCurrentChannel,
+        payload: e.candidate,
+      });
+    }
+  };
+
+  pc.ontrack = function(e) {
+    var audio = document.getElementById('voice-audio-' + target);
+    if (!audio) {
+      audio = document.createElement('audio');
+      audio.id = 'voice-audio-' + target;
+      audio.autoplay = true;
+      audio.style.display = 'none';
+      document.body.appendChild(audio);
+    }
+    audio.srcObject = e.streams[0];
+  };
+
+  pc.onconnectionstatechange = function() {
+    if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+      voiceRemovePeer(target);
+    }
+  };
+
+  pc.createOffer().then(function(offer) {
+    return pc.setLocalDescription(offer);
+  }).then(function() {
+    sendMsg({
+      type: 'voice_signal',
+      target: target,
+      signal_type: 'offer',
+      channel_id: voiceCurrentChannel,
+      payload: { sdp: pc.localDescription.sdp, type: pc.localDescription.type },
+    });
+  }).catch(function(e) {
+    console.warn('offer error:', e);
+  });
+}
+
+function voiceHandleSignal(from, signalType, payload) {
+  if (signalType === 'offer') {
+    var cfg = { iceServers: [{ urls: VOICE_STUN }] };
+    var pc = new RTCPeerConnection(cfg);
+    voicePeerConnections[from] = pc;
+
+    if (voiceLocalStream) {
+      voiceLocalStream.getTracks().forEach(function(t) {
+        pc.addTrack(t, voiceLocalStream);
+      });
+    }
+
+    pc.onicecandidate = function(e) {
+      if (e.candidate) {
+        sendMsg({
+          type: 'voice_signal',
+          target: from,
+          signal_type: 'ice',
+          channel_id: voiceCurrentChannel,
+          payload: e.candidate,
+        });
+      }
+    };
+
+    pc.ontrack = function(e) {
+      var audio = document.getElementById('voice-audio-' + from);
+      if (!audio) {
+        audio = document.createElement('audio');
+        audio.id = 'voice-audio-' + from;
+        audio.autoplay = true;
+        audio.style.display = 'none';
+        document.body.appendChild(audio);
+      }
+      audio.srcObject = e.streams[0];
+    };
+
+    pc.onconnectionstatechange = function() {
+      if (pc.connectionState === 'failed' || pc.connectionState === 'disconnected') {
+        voiceRemovePeer(from);
+      }
+    };
+
+    pc.setRemoteDescription(new RTCSessionDescription(payload)).then(function() {
+      return pc.createAnswer();
+    }).then(function(answer) {
+      return pc.setLocalDescription(answer);
+    }).then(function() {
+      sendMsg({
+        type: 'voice_signal',
+        target: from,
+        signal_type: 'answer',
+        channel_id: voiceCurrentChannel,
+        payload: { sdp: pc.localDescription.sdp, type: pc.localDescription.type },
+      });
+    }).catch(function(e) {
+      console.warn('answer error:', e);
+    });
+
+  } else if (signalType === 'answer') {
+    var pc2 = voicePeerConnections[from];
+    if (pc2 && pc2.remoteDescription === null) {
+      pc2.setRemoteDescription(new RTCSessionDescription(payload)).catch(function(e) {
+        console.warn('remote desc error:', e);
+      });
+    }
+  } else if (signalType === 'ice') {
+    var pc3 = voicePeerConnections[from];
+    if (pc3) {
+      pc3.addIceCandidate(new RTCIceCandidate(payload)).catch(function(e) {
+        console.warn('ice error:', e);
+      });
+    }
+  }
+}
+
+function voiceRemovePeer(username) {
+  var pc = voicePeerConnections[username];
+  if (pc) {
+    pc.close();
+    delete voicePeerConnections[username];
+  }
+  var audio = document.getElementById('voice-audio-' + username);
+  if (audio) {
+    audio.srcObject = null;
+    audio.remove();
+  }
+}
+
+function voiceCleanup() {
+  Object.keys(voicePeerConnections).forEach(voiceRemovePeer);
+  voicePeerConnections = {};
+  voiceCurrentChannel = null;
+  voiceCurrentMembers = [];
+  voiceJoined = false;
+  voiceMuted = false;
+  voiceDeafened = false;
+  if (voiceLocalStream) {
+    voiceLocalStream.getTracks().forEach(function(t) { t.stop(); });
+    voiceLocalStream = null;
+  }
+  $('voice-now').hidden = true;
+}
 
 function escapeHtml(str) {
   const div = document.createElement('div');

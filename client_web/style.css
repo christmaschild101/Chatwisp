@@ -324,3 +324,49 @@ textarea:focus {
     max-height: 60vh;
   }
 }
+
+/* Voice Chat */
+#voice-section {
+  background: #f0f4ff;
+  border: 1px solid #d0d8e8;
+  border-radius: 8px;
+  padding: 10px;
+  margin-bottom: 10px;
+}
+#voice-section h3 {
+  font-size: 16px;
+  margin: 0 0 8px 0;
+  color: #2c3e50;
+}
+.voice-channel-item {
+  padding: 6px 8px;
+  cursor: pointer;
+  border-radius: 4px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+.voice-channel-item:hover {
+  background: #dce6f5;
+}
+.voice-channel-name {
+  font-weight: 600;
+}
+.voice-channel-count {
+  font-size: 14px;
+  color: #666;
+}
+.voice-now {
+  background: #d4edda;
+  border: 1px solid #c3e6cb;
+  border-radius: 6px;
+  padding: 8px;
+  margin-bottom: 8px;
+}
+.voice-now .btn-group {
+  margin-top: 6px;
+}
+.voice-muted { opacity: 0.5; }
+#voice-channel-list { margin: 4px 0; }
+#voice-create-area { margin-top: 6px; display: flex; gap: 6px; }
+#voice-create-area input { flex: 1; }
