@@ -407,7 +407,10 @@ function showMainMenu() {
   if (voiceJoined) voiceCleanup();
   showView('view-main');
   hideAllSections();
-  $('voice-section').hidden = true;
+  $('voice-section').hidden = false;
+  $('voice-channel-list').innerHTML = '<div class="voice-channel-item" style="cursor:default;color:#888">Select a forum to see its voice channels</div>';
+  $('voice-show-create-btn').hidden = true;
+  $('voice-now').hidden = true;
   $('forum-section').hidden = false;
   $('admin-controls').hidden = !isAdmin;
   $('section-title').textContent = 'Select Forum';
@@ -1067,6 +1070,13 @@ function selectForum(forumId) {
 function renderVoiceChannels(forumId) {
   const list = $('voice-channel-list');
   list.innerHTML = '';
+  if (!voiceChannels.length) {
+    const msg = document.createElement('div');
+    msg.className = 'voice-channel-item';
+    msg.style.cssText = 'cursor:default;color:#888';
+    msg.textContent = 'No voice channels yet';
+    list.appendChild(msg);
+  }
   voiceChannels.forEach(function(ch) {
     const div = document.createElement('div');
     div.className = 'voice-channel-item';
@@ -1080,7 +1090,7 @@ function renderVoiceChannels(forumId) {
     });
     list.appendChild(div);
   });
-  $('voice-show-create-btn').hidden = !isAdmin;
+  $('voice-show-create-btn').hidden = false;
   if (voiceJoined) {
     voiceShowActiveChannel();
   } else {
