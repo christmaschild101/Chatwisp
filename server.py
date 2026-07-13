@@ -1073,7 +1073,13 @@ class Database:
             f"SELECT id, forum_id, name, created_at FROM voice_channels WHERE forum_id = {p}1 ORDER BY created_at ASC",
             forum_id
         )
-        return [dict(r) for r in self.backend.rows_to_list(rows)]
+        channels = []
+        for r in self.backend.rows_to_list(rows):
+            ch = dict(r)
+            if isinstance(ch.get("created_at"), datetime):
+                ch["created_at"] = ch["created_at"].isoformat()
+            channels.append(ch)
+        return channels
 
     async def delete_voice_channel(self, channel_id):
         p = self.backend.placeholder()
