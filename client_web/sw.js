@@ -1,4 +1,4 @@
-const CACHE = "chatwisp-v1";
+const CACHE = "chatwisp-v2";
 const ASSETS = [
   "/",
   "/index.html",
