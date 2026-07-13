@@ -1118,6 +1118,13 @@ class ChatServer:
             await websocket.send(json.dumps(data))
         except websockets.exceptions.ConnectionClosed:
             pass
+        except TypeError as e:
+            import traceback
+            traceback.print_exc()
+            try:
+                await websocket.send(json.dumps({"type": "error", "message": f"Serialization error: {e}"}))
+            except websockets.exceptions.ConnectionClosed:
+                pass
 
     def is_authenticated(self, websocket):
         return websocket in self.clients
@@ -1919,6 +1926,8 @@ class ChatServer:
             return await self.send(websocket, {"type": "error", "message": "forum_id and name required"})
         try:
             channel = await self.storage.create_voice_channel(forum_id, name)
+            if not channel:
+                return await self.send(websocket, {"type": "error", "message": "Failed to create voice channel"})
         except Exception as e:
             return await self.send(websocket, {"type": "error", "message": f"Failed to create voice channel: {e}"})
         await self.send(websocket, {"type": "voice_channel_created", "channel": channel})
@@ -1932,6 +1941,8 @@ class ChatServer:
         channels = await self.storage.get_voice_channels(forum_id)
         enriched = []
         for ch in channels:
+            if not ch or "id" not in ch:
+                continue
             member_count = len(self.voice_members.get(ch["id"], {}))
             enriched.append({**ch, "member_count": member_count})
         await self.send(websocket, {"type": "voice_channels_list", "forum_id": forum_id, "channels": enriched})

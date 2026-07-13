@@ -106,8 +106,19 @@ function doConnect(wsUrl, user, pass, mode) {
   };
 
   ws.onmessage = function(event) {
-    const data = JSON.parse(event.data);
-    handleServerMessage(data);
+    var data;
+    try {
+      data = JSON.parse(event.data);
+    } catch (e) {
+      return;
+    }
+    try {
+      handleServerMessage(data);
+    } catch (e) {
+      if (typeof console !== 'undefined' && console.error) {
+        console.error('handleServerMessage error:', e);
+      }
+    }
   };
 
   ws.onclose = function() {
@@ -1078,12 +1089,13 @@ function renderVoiceChannels(forumId) {
     list.appendChild(msg);
   }
   voiceChannels.forEach(function(ch) {
+    if (!ch || !ch.id) return;
     const div = document.createElement('div');
     div.className = 'voice-channel-item';
     div.setAttribute('role', 'listitem');
     div.setAttribute('tabindex', '0');
     const count = ch.member_count || 0;
-    div.innerHTML = '<span class="voice-channel-name">🔊 ' + escapeHtml(ch.name) + '</span><span class="voice-channel-count">' + count + ' online</span>';
+    div.innerHTML = '<span class="voice-channel-name">🔊 ' + escapeHtml(ch.name || 'Unknown') + '</span><span class="voice-channel-count">' + count + ' online</span>';
     div.addEventListener('click', function() { voiceJoin(ch.id); });
     div.addEventListener('keydown', function(e) {
       if (e.key === 'Enter') { voiceJoin(ch.id); }
