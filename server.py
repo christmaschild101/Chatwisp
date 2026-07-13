@@ -72,6 +72,8 @@ def _read_static(path):
 INDEX_HTML = _read_static("index.html")
 APP_JS = _read_static("app.js")
 STYLE_CSS = _read_static("style.css")
+MANIFEST_JSON = _read_static("manifest.json")
+SW_JS = _read_static("sw.js")
 
 MUSIC_DIR = os.path.join(CLIENT_WEB_DIR, "music")
 AVAILABLE_SONGS = ["ByTheFire", "Frozen-in-Time", "Noisescape", "TranquilReflections", "Wonder"]
@@ -1848,6 +1850,18 @@ class ChatServer:
                 return Response(200, "OK", Headers({"Content-Type": "application/javascript; charset=utf-8"}), APP_JS.encode("utf-8"))
             if request.path == "/style.css" and STYLE_CSS is not None:
                 return Response(200, "OK", Headers({"Content-Type": "text/css; charset=utf-8"}), STYLE_CSS.encode("utf-8"))
+            if request.path == "/manifest.json" and MANIFEST_JSON is not None:
+                return Response(200, "OK", Headers({"Content-Type": "application/manifest+json; charset=utf-8"}), MANIFEST_JSON.encode("utf-8"))
+            if request.path == "/sw.js" and SW_JS is not None:
+                return Response(200, "OK", Headers({"Content-Type": "application/javascript; charset=utf-8"}), SW_JS.encode("utf-8"))
+            if request.path.startswith("/icons/") and request.path.count("/") == 2:
+                filename = request.path.split("/")[-1]
+                filepath = os.path.join(CLIENT_WEB_DIR, "icons", filename)
+                if os.path.isfile(filepath):
+                    with open(filepath, "rb") as f:
+                        content_type = "image/png" if filename.endswith(".png") else "application/octet-stream"
+                        return Response(200, "OK", Headers({"Content-Type": content_type}), f.read())
+                return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"File not found\n")
             if request.path.startswith("/forums/") and INDEX_HTML is not None:
                 return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), INDEX_HTML.encode("utf-8"))
             if request.path.startswith("/music/") and request.path.count("/") == 2:

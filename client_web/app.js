@@ -25,6 +25,14 @@ let keepaliveInterval = null;
 
 function $(id) { return document.getElementById(id); }
 
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function() {
+    navigator.serviceWorker.register('sw.js').catch(function(e) {
+      console.warn('SW registration failed:', e);
+    });
+  });
+}
+
 function announce(msg) {
   const status = $('status-bar');
   status.textContent = msg;
