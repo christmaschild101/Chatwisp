@@ -66,6 +66,20 @@ All configuration comes from environment variables:
 - **bcrypt passwords** — SHA-256 legacy hashes auto-upgraded on login
 - **Security** — Minimum 8-char passwords, super_admin ban protection
 
+## Voice channels
+
+Users can create per-forum voice channels and join them for real-time conversation. Voice uses **WebRTC peer-to-peer** — the server only relays signaling (SDP offer/answer, ICE candidates). No audio data passes through the server.
+
+- **Create** — any user can create a voice channel in a forum (`voice_create`)
+- **Join / Leave** — join a channel to see other members; leave to disconnect
+- **Mute / Deafen** — mute your mic or deafen all audio; state propagates to other members
+- **Signaling** — the server forwards WebRTC handshake messages between peers in the same channel (`voice_signal`)
+- **Rate capped** — max 20 signaling messages per second per user to prevent abuse
+- **STUN only** — uses Google's public STUN server (`stun:stun.l.google.com:19302`). No TURN server — users behind symmetric NAT will not be able to connect P2P
+- **No persistence** — channel membership is in-memory only (lost on server restart/spin-down). Channels themselves persist in the database
+
+Voice is available on the web client. The Windows client does not currently support voice.
+
 ## Music
 
 The server serves 5 royalty-free MP3s from the `/music/` endpoint. Music was removed from both clients in v3.3.0. The MP3 files remain in `client_web/music/` (gitignored) for server-side use only.
