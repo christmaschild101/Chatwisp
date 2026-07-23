@@ -45,6 +45,19 @@
         </div>
         <p id="login-error" role="alert" aria-live="assertive" class="error-text" hidden></p>
       </form>
+      <div id="ccauth-section">
+        <hr class="auth-divider">
+        <button id="ccauth-btn" onclick="startCcauthLogin()">Sign in with christmaschild Account</button>
+      </div>
+      <div id="ccauth-username-prompt" hidden>
+        <p>Choose a username for your new account:</p>
+        <div class="form-group">
+          <label for="ccauth-username">Username:</label>
+          <input type="text" id="ccauth-username" minlength="3" placeholder="At least 3 characters">
+        </div>
+        <button onclick="completeCcauthRegistration()">Create Account</button>
+        <p id="ccauth-register-error" role="alert" class="error-text" hidden></p>
+      </div>
     </div>
 
     <div id="view-main" class="view" hidden aria-label="Main menu">

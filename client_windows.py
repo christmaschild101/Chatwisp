@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import wx
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 DEFAULT_URI = "wss://chatwisp.onrender.com"
+AUTH_SERVER_URL = "https://christmaschild-auth.onrender.com"
 import json
 import threading
 import queue
@@ -10,6 +11,12 @@ import sys
 import os
 import time
 import ctypes
+import urllib.request
+import urllib.parse
+import http.server
+import webbrowser
+import random
+import secrets as _secrets
 
 try:
     import websockets.sync.client
@@ -233,6 +240,18 @@ class ChatwispFrame(wx.Frame):
         btn_sz.Add(self.register_btn, 0, wx.LEFT, 8)
 
         sz.Add(btn_sz, 0, wx.LEFT, 20)
+        sz.AddSpacer(15)
+
+        sep = wx.StaticLine(pnl)
+        sz.Add(sep, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        sz.AddSpacer(10)
+
+        self.ccauth_btn = wx.Button(pnl, label="Sign in with christmaschild Account")
+        self.ccauth_btn.SetBackgroundColour(wx.Colour(44, 62, 80))
+        self.ccauth_btn.SetForegroundColour(wx.WHITE)
+        self.ccauth_btn.Bind(wx.EVT_BUTTON, self.on_ccauth_login)
+        sz.Add(self.ccauth_btn, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+
         sz.AddStretchSpacer()
         pnl.SetSizer(sz)
         self.switch_view(pnl)
@@ -255,6 +274,179 @@ class ChatwispFrame(wx.Frame):
             wx.MessageBox("Password must be at least 8 characters", "Error", wx.OK | wx.ICON_ERROR)
             return
         self._do_auth("register")
+
+    def on_ccauth_login(self, event):
+        self.ccauth_btn.Disable()
+        self.login_btn.Disable()
+        self.register_btn.Disable()
+        self.announce("Opening browser for christmaschild authentication...")
+        threading.Thread(target=self._ccauth_oauth_flow, daemon=True).start()
+
+    def _ccauth_oauth_flow(self):
+        token_container = [None]
+        state = _secrets.token_urlsafe(32)
+        port = random.randint(20000, 60000)
+
+        class CallbackHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/callback":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    code = params.get("code", [""])[0]
+                    cb_state = params.get("state", [""])[0]
+                    if cb_state != state:
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"State mismatch. Please try again.")
+                        return
+                    if not code:
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"Missing authorization code.")
+                        return
+                    try:
+                        data = json.dumps({"code": code}).encode("utf-8")
+                        req = urllib.request.Request(
+                            f"{AUTH_SERVER_URL}/api/auth/token",
+                            data=data,
+                            headers={"Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            result = json.loads(resp.read().decode("utf-8"))
+                        token_container[0] = result.get("token")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(b"<html><body><h2>Authentication successful!</h2><p>You may close this window and return to Chatwisp.</p></body></html>")
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(f"<html><body><h2>Authentication failed</h2><p>{e}</p></body></html>".encode("utf-8"))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def do_OPTIONS(self):
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
+        server.timeout = 120
+        redirect_uri = f"http://127.0.0.1:{port}/callback"
+        auth_url = (
+            f"{AUTH_SERVER_URL}/api/auth/authorize"
+            f"?service=chatwisp"
+            f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
+            f"&state={urllib.parse.quote(state, safe='')}"
+        )
+        wx.CallAfter(webbrowser.open, auth_url)
+        self.announce("Waiting for authentication in browser...")
+        while token_container[0] is None:
+            server.handle_request()
+            if token_container[0] is not None:
+                break
+        server.server_close()
+        token = token_container[0]
+        if token:
+            wx.CallAfter(self._on_ccauth_token_received, token)
+        else:
+            wx.CallAfter(self._ccauth_login_failed, "Authentication failed or was cancelled.")
+
+    def _on_ccauth_token_received(self, token):
+        self._ccauth_token = token
+        self._server_uri = self._server_uri or DEFAULT_URI
+        uri = self._server_uri
+        self.announce(f"Connecting to {uri}...")
+        threading.Thread(
+            target=self._ccauth_ws_connect,
+            args=(uri, token),
+            daemon=True
+        ).start()
+
+    def _ccauth_ws_connect(self, uri, token):
+        try:
+            with websockets.sync.client.connect(uri) as ws:
+                self.ws = ws
+                self.connected = True
+                ws.send(json.dumps({"type": "login_ccauth", "token": token, "client_version": VERSION}))
+                response = json.loads(ws.recv())
+                if response.get("type") == "login_success":
+                    self._saved_username = response["username"]
+                    self.username = response["username"]
+                    self.is_admin = response.get("is_admin", False)
+                    self.is_super_admin = response.get("super_admin", False)
+                    self.recv_queue.put(("auth_success", response))
+                    self._ws_recv_loop(ws)
+                elif response.get("type") == "ccauth_new_user":
+                    wx.CallAfter(self._on_ccauth_new_user, response.get("email", ""), token)
+                    ws.close()
+                else:
+                    self.recv_queue.put(("auth_error", response.get("message", "Authentication failed")))
+                    ws.close()
+        except Exception as e:
+            self.recv_queue.put(("connection_error", str(e)))
+
+    def _on_ccauth_new_user(self, email, token):
+        self._ccauth_token = token
+        self.ccauth_btn.Enable()
+        self.login_btn.Enable()
+        self.register_btn.Enable()
+        dlg = wx.TextEntryDialog(
+            self,
+            f"Choose a username for your new account.\nYour christmaschild email: {email}",
+            "Create Account",
+            "",
+            wx.OK | wx.CANCEL
+        )
+        if dlg.ShowModal() == wx.ID_OK:
+            username = dlg.GetValue().strip()
+            dlg.Destroy()
+            if len(username) < 3:
+                wx.MessageBox("Username must be at least 3 characters", "Error", wx.OK | wx.ICON_ERROR)
+                return
+            self.login_btn.Disable()
+            self.register_btn.Disable()
+            self.ccauth_btn.Disable()
+            threading.Thread(
+                target=self._ccauth_register,
+                args=(self._server_uri or DEFAULT_URI, token, username),
+                daemon=True
+            ).start()
+        else:
+            dlg.Destroy()
+
+    def _ccauth_register(self, uri, token, username):
+        try:
+            with websockets.sync.client.connect(uri) as ws:
+                ws.send(json.dumps({
+                    "type": "complete_ccauth_registration",
+                    "token": token,
+                    "username": username,
+                    "client_version": VERSION
+                }))
+                response = json.loads(ws.recv())
+                if response.get("type") == "login_success":
+                    self._saved_username = response["username"]
+                    self.username = response["username"]
+                    self.is_admin = response.get("is_admin", False)
+                    self.is_super_admin = response.get("super_admin", False)
+                    self.recv_queue.put(("auth_success", response))
+                    self._ws_recv_loop(ws)
+                else:
+                    self.recv_queue.put(("auth_error", response.get("message", "Registration failed")))
+                    ws.close()
+        except Exception as e:
+            self.recv_queue.put(("connection_error", str(e)))
+
+    def _ccauth_login_failed(self, msg):
+        self.ccauth_btn.Enable()
+        self.login_btn.Enable()
+        self.register_btn.Enable()
+        wx.MessageBox(msg, "Authentication Error", wx.OK | wx.ICON_ERROR)
+        self.announce("Authentication failed")
 
     def _do_auth(self, mode):
         username = self.login_user.GetValue().strip()
@@ -409,6 +601,8 @@ class ChatwispFrame(wx.Frame):
     def _enable_login_buttons(self):
         self.login_btn.Enable()
         self.register_btn.Enable()
+        if hasattr(self, 'ccauth_btn'):
+            self.ccauth_btn.Enable()
 
     def _handle_server_message(self, data):
         dtype = data.get("type")

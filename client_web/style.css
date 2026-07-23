@@ -97,6 +97,34 @@ button:active {
   background: #1a5276;
 }
 
+.auth-divider {
+  margin: 20px 0;
+  border: none;
+  border-top: 1px solid #ccc;
+}
+
+#ccauth-section {
+  margin-top: 15px;
+}
+
+#ccauth-btn {
+  background: #2c3e50;
+  border-color: #2c3e50;
+  width: 100%;
+}
+
+#ccauth-btn:hover, #ccauth-btn:focus {
+  background: #34495e;
+  border-color: #34495e;
+}
+
+#ccauth-username-prompt {
+  margin-top: 15px;
+  padding: 15px;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+}
+
 .form-group {
   margin-bottom: 15px;
 }
