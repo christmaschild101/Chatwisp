@@ -13,6 +13,7 @@ let unreadCount = 0;
 let pendingLink = null;
 let currentTopicSlug = null;
 let pendingLinkTopicId = null;
+let ccauthPendingToken = null;
 
 let savedWsUrl = null;
 let savedUser = null;
@@ -75,6 +76,20 @@ function hideAllSections() {
   $('admin-topic-adminonly-btn').hidden = true;
 }
 
+(function checkCcauthCallback() {
+  var params = new URLSearchParams(window.location.search);
+  if (params.get('ccauth') === '1') {
+    var token = localStorage.getItem('ccauth_token');
+    if (token) {
+      localStorage.removeItem('ccauth_token');
+      localStorage.removeItem('ccauth_email');
+      history.replaceState(null, '', '/');
+      ccauthPendingToken = token;
+      doConnect("wss://chatwisp.onrender.com", '', '', 'ccauth_auto');
+    }
+  }
+})();
+
 function connect() {
   const user = $('login-username').value.trim();
   const pass = $('login-password').value;
@@ -96,7 +111,13 @@ function doConnect(wsUrl, user, pass, mode) {
 
   ws.onopen = function() {
     announce('Connected. Authenticating...');
-    ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "4.0.0" }));
+    if (mode === 'ccauth_auto') {
+      ws.send(JSON.stringify({ type: 'login_ccauth', token: ccauthPendingToken, client_version: "4.1.0" }));
+    } else if (mode === 'ccauth_register') {
+      ws.send(JSON.stringify({ type: 'complete_ccauth_registration', token: ccauthPendingToken, username: $('ccauth-username').value.trim(), client_version: "4.1.0" }));
+    } else {
+      ws.send(JSON.stringify({ type: mode, username: user, password: pass, client_version: "4.1.0" }));
+    }
     if (keepaliveInterval) clearInterval(keepaliveInterval);
     keepaliveInterval = setInterval(function() {
       if (ws && ws.readyState === WebSocket.OPEN) {
@@ -178,14 +199,25 @@ function handleServerMessage(data) {
     unreadCount = data.count || 0;
     updateMessagesBadge();
   } else if (type === 'login_error' || type === 'register_error') {
-    $('login-error').textContent = data.message;
-    $('login-error').hidden = false;
+    if (!$('ccauth-username-prompt').hidden) {
+      $('ccauth-register-error').textContent = data.message;
+      $('ccauth-register-error').hidden = false;
+    } else {
+      $('login-error').textContent = data.message;
+      $('login-error').hidden = false;
+    }
     announce('Authentication failed');
   } else if (type === 'register_success') {
     $('login-error').textContent = 'Registration successful! You can now log in.';
     $('login-error').style.color = '#27ae60';
     $('login-error').hidden = false;
     announce('Registration successful');
+  } else if (type === 'ccauth_new_user') {
+    ccauthPendingToken = data.token;
+    $('login-form').hidden = true;
+    $('ccauth-section').hidden = true;
+    $('ccauth-username-prompt').hidden = false;
+    $('ccauth-username').focus();
   } else if (type === 'forums_list') {
     forumsData = data.forums;
     renderForums(data.forums);
@@ -406,6 +438,27 @@ function doRegister() {
     return;
   }
   doConnect("wss://chatwisp.onrender.com", user, pass, 'register');
+}
+
+function startCcauthLogin() {
+  var state = crypto.randomUUID();
+  sessionStorage.setItem('ccauth_state', state);
+  var url = 'https://christmaschild-auth.onrender.com/api/auth/authorize' +
+    '?service=chatwisp' +
+    '&redirect_uri=' + encodeURIComponent(window.location.origin + '/auth/callback') +
+    '&state=' + encodeURIComponent(state);
+  window.location.href = url;
+}
+
+function completeCcauthRegistration() {
+  var uname = $('ccauth-username').value.trim();
+  if (!uname || uname.length < 3) {
+    $('ccauth-register-error').textContent = 'Username must be at least 3 characters';
+    $('ccauth-register-error').hidden = false;
+    return;
+  }
+  $('ccauth-register-error').hidden = true;
+  doConnect("wss://chatwisp.onrender.com", '', '', 'ccauth_register');
 }
 
 function disconnect() {

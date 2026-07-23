@@ -9,15 +9,18 @@ import signal
 import time
 import uuid
 import sys
+import urllib.request
+import urllib.parse
 import bcrypt
 from datetime import datetime, timedelta, timezone
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 SERVER_START_TIME = time.time()
 BOT_USERNAME = "Chatwisp Official Account"
-MINIMUM_CLIENT_VERSION = "4.0.0"
+MINIMUM_CLIENT_VERSION = "4.1.0"
 DOWNLOAD_URL = "https://chatwisp-sight.onrender.com/"
+AUTH_SERVER_URL = "https://christmaschild-auth.onrender.com"
 
 try:
     import websockets
@@ -364,6 +367,7 @@ class Database:
             await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS is_bot BOOLEAN NOT NULL DEFAULT FALSE")
             await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS signature TEXT NOT NULL DEFAULT ''")
             await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS music_prefs TEXT NOT NULL DEFAULT '{}'")
+            await self.backend.execute("ALTER TABLE users ADD COLUMN IF NOT EXISTS ccauth_id TEXT")
             await self.backend.execute(f"UPDATE users SET super_admin = TRUE WHERE username = 'christmas_child' AND super_admin = FALSE")
             await self.backend.execute(f"INSERT INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!') ON CONFLICT DO NOTHING")
             bot = await self.backend.fetchrow(f"SELECT username FROM users WHERE username = {p}1", BOT_USERNAME)
@@ -446,6 +450,7 @@ class Database:
                 )
             """)
             await self.backend.execute(f"UPDATE users SET super_admin = 1 WHERE username = 'christmas_child' AND super_admin = 0")
+            await self.backend.execute("ALTER TABLE users ADD COLUMN ccauth_id TEXT")
             await self.backend.execute(f"INSERT OR IGNORE INTO settings (key, value) VALUES ('motd', 'Welcome to Chatwisp!')")
             bot = await self.backend.fetchrow(f"SELECT username FROM users WHERE username = ?", BOT_USERNAME)
             if not bot:
@@ -614,6 +619,7 @@ class Database:
                 "ban_until": row.get("ban_until"),
                 "is_bot": bool(row.get("is_bot", False)) if self._mode == "sqlite" else row.get("is_bot", False),
                 "signature": row.get("signature") or "",
+                "ccauth_id": row.get("ccauth_id"),
                 "created_at": created.isoformat() if hasattr(created, 'isoformat') else str(created) if created else None,
             }
         return None
@@ -1102,6 +1108,45 @@ class Database:
         return self.backend.status_matches(result, "UPDATE") and not self.backend.status_matches(result, "UPDATE 0")
 
 
+def _http_post_json(url, body):
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except Exception:
+        return None
+
+
+def _ccauth_callback_html(code, state):
+    return (
+        '<!DOCTYPE html><html><head><title>Authenticating...</title></head><body>'
+        '<p>Authenticating with christmaschild account...</p>'
+        '<p id="status">Exchanging authorization code...</p>'
+        '<script>'
+        '(async function() {'
+        '  try {'
+        f'    const resp = await fetch("{AUTH_SERVER_URL}/api/auth/token", {{'
+        '      method: "POST",'
+        '      headers: {"Content-Type": "application/json"},'
+        f'      body: JSON.stringify({{code: {json.dumps(code)}}})'
+        '    });'
+        '    const data = await resp.json();'
+        '    if (!resp.ok) {'
+        '      document.getElementById("status").textContent = "Authentication failed: " + (data.error || "Unknown error");'
+        '      return;'
+        '    }'
+        '    localStorage.setItem("ccauth_token", data.token);'
+        '    localStorage.setItem("ccauth_email", data.user ? data.user.email : "");'
+        '    window.location.href = "/?ccauth=1";'
+        '  } catch(e) {'
+        '    document.getElementById("status").textContent = "Error: " + e.message;'
+        '  }'
+        '})();'
+        '</script></body></html>'
+    )
+
+
 class ChatServer:
     def __init__(self, host="0.0.0.0", port=8765):
         self.host = host
@@ -1226,6 +1271,8 @@ class ChatServer:
             "voice_signal": self.handle_voice_signal,
             "voice_mute": self.handle_voice_mute,
             "voice_deafen": self.handle_voice_deafen,
+            "login_ccauth": self.handle_login_ccauth,
+            "complete_ccauth_registration": self.handle_complete_ccauth_registration,
         }
 
         handler = handlers.get(msg_type)
@@ -2040,6 +2087,120 @@ class ChatServer:
             "username": username,
         }, exclude=websocket)
 
+    async def _verify_ccauth_token(self, token):
+        def _do_verify():
+            return _http_post_json(f"{AUTH_SERVER_URL}/api/auth/verify", {"token": token})
+        return await asyncio.to_thread(_do_verify)
+
+    async def _exchange_ccauth_code(self, code):
+        def _do_exchange():
+            return _http_post_json(f"{AUTH_SERVER_URL}/api/auth/token", {"code": code})
+        return await asyncio.to_thread(_do_exchange)
+
+    async def _complete_login(self, websocket, username, user):
+        is_admin = user.get("is_admin", False)
+        super_admin = user.get("super_admin", False)
+        now = datetime.now(timezone.utc)
+        if user.get("banned"):
+            ban_until = user.get("ban_until")
+            if ban_until:
+                if isinstance(ban_until, str):
+                    try:
+                        ban_until = datetime.fromisoformat(ban_until)
+                    except (ValueError, TypeError):
+                        ban_until = None
+                if ban_until and ban_until > now:
+                    reason = user.get("ban_reason") or "No reason given"
+                    remaining = ban_until - now
+                    days = remaining.days
+                    hours = remaining.seconds // 3600
+                    mins = (remaining.seconds % 3600) // 60
+                    parts = []
+                    if days: parts.append(f"{days}d")
+                    parts.append(f"{hours}h {mins}m")
+                    return await self.send(websocket, {"type": "login_error", "message": f"You are banned. Remaining time: {' '.join(parts)}. Reason: {reason}"})
+                else:
+                    await self.storage.unban_user(username)
+        self.clients[websocket] = {"username": username, "is_admin": is_admin, "super_admin": super_admin}
+        await self.send(websocket, {
+            "type": "login_success",
+            "username": username,
+            "is_admin": is_admin,
+            "super_admin": super_admin,
+            "version": VERSION,
+        })
+        unread = await self.storage.get_total_unread(username)
+        await self.send(websocket, {"type": "unread_dms", "count": unread})
+        motd = await self.storage.get_motd()
+        await self.send(websocket, {
+            "type": "welcome",
+            "version": VERSION,
+            "motd": motd,
+            "message": f"Welcome! server version is {VERSION}. Message of the day: {motd}",
+        })
+
+    async def handle_login_ccauth(self, websocket, data):
+        token = data.get("token", "").strip()
+        if not token:
+            return await self.send(websocket, {"type": "login_error", "message": "Token required"})
+        ip = websocket.remote_address[0] if hasattr(websocket, "remote_address") else "unknown"
+        if self._is_rate_limited(f"login:{ip}"):
+            return await self.send(websocket, {"type": "login_error", "message": "Too many login attempts. Please try again later."})
+        self._record_attempt(f"login:{ip}")
+        client_version = data.get("client_version", "")
+        if await self._reject_outdated_client(websocket, "login_error", client_version):
+            return
+        result = await self._verify_ccauth_token(token)
+        if not result or not result.get("valid"):
+            return await self.send(websocket, {"type": "login_error", "message": "Invalid or expired christmaschild token"})
+        cc_user = result.get("user", {})
+        cc_id = cc_user.get("id", "")
+        cc_email = cc_user.get("email", "")
+        p = self.storage.backend.placeholder()
+        row = await self.storage.backend.fetchrow(
+            f"SELECT username FROM users WHERE ccauth_id = {p}1", cc_id
+        )
+        if row:
+            username = row["username"] if isinstance(row, dict) else row[0]
+            user = await self.storage.get_user(username)
+            if user:
+                return await self._complete_login(websocket, username, user)
+        await self.send(websocket, {"type": "ccauth_new_user", "email": cc_email, "token": token})
+
+    async def handle_complete_ccauth_registration(self, websocket, data):
+        token = data.get("token", "").strip()
+        username = data.get("username", "").strip()
+        if not token or not username:
+            return await self.send(websocket, {"type": "register_error", "message": "Token and username required"})
+        if len(username) < 3:
+            return await self.send(websocket, {"type": "register_error", "message": "Username must be at least 3 characters"})
+        ip = websocket.remote_address[0] if hasattr(websocket, "remote_address") else "unknown"
+        if self._is_rate_limited(f"register:{ip}"):
+            return await self.send(websocket, {"type": "register_error", "message": "Too many registration attempts. Please try again later."})
+        self._record_attempt(f"register:{ip}")
+        result = await self._verify_ccauth_token(token)
+        if not result or not result.get("valid"):
+            return await self.send(websocket, {"type": "register_error", "message": "Invalid or expired christmaschild token"})
+        cc_user = result.get("user", {})
+        cc_id = cc_user.get("id", "")
+        cc_email = cc_user.get("email", "")
+        if await self.storage.get_user(username):
+            return await self.send(websocket, {"type": "register_error", "message": "Username already exists"})
+        random_pass = secrets.token_hex(16)
+        p = self.storage.backend.placeholder()
+        try:
+            await self.storage.backend.execute(
+                f"INSERT INTO users (username, password_hash, is_admin, super_admin, ccauth_id) VALUES ({p}1, {p}2, FALSE, FALSE, {p}3)",
+                username, self.storage._hash(random_pass), cc_id
+            )
+        except Exception:
+            return await self.send(websocket, {"type": "register_error", "message": "Failed to create account"})
+        user = await self.storage.get_user(username)
+        if user:
+            await self._complete_login(websocket, username, user)
+        else:
+            await self.send(websocket, {"type": "register_error", "message": "Failed to create account"})
+
     async def handler(self, websocket):
         try:
             async for raw in websocket:
@@ -2087,6 +2248,16 @@ class ChatServer:
                     with open(filepath, "rb") as f:
                         return Response(200, "OK", Headers({"Content-Type": "audio/mpeg"}), f.read())
                 return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"File not found\n")
+            if request.path.startswith("/auth/callback"):
+                qs = urllib.parse.urlparse(request.path).query
+                params = urllib.parse.parse_qs(qs)
+                code = params.get("code", [""])[0]
+                state = params.get("state", [""])[0]
+                if code:
+                    body = _ccauth_callback_html(code, state)
+                else:
+                    body = '<html><body><p>Missing authorization code.</p></body></html>'
+                return Response(200, "OK", Headers({"Content-Type": "text/html; charset=utf-8"}), body.encode("utf-8"))
             return Response(404, "Not Found", Headers({"Content-Type": "text/plain; charset=utf-8"}), b"Not Found\n")
 
         loop = asyncio.get_running_loop()
