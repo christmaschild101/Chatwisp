@@ -17,6 +17,8 @@ site/                  # Download page + Chatwisp.exe for distribution
 - **`main`** — working branch, deployed to central server (Render).
 - **`source`** — public release branch. Merge `main` into `source` after stable releases.
 
+Note: the repo default checkout and `origin/HEAD` are on **`master`** (which is kept in sync with `main`); the documented release flow uses `main`. Check `git branch --show-current` before pushing a release.
+
 After pushing a release, do:
 
 ```bash
@@ -53,9 +55,10 @@ On first run, the server creates these tables automatically:
 - **`posts`** — id (UUID), topic_id (FK→topics), author (FK→users), content, created_at
 - **`dms`** — id (UUID), sender (FK→users), recipient (FK→users), content, read, created_at
 - **`settings`** — key (text PK), value (text) — stores server config like MOTD
+- **`voice_channels`** — id, forum_id (FK→forums), name, created_at. Channel *membership* is in-memory only (lost on restart); the channels themselves persist.
 - **`music_prefs`** column on users table (JSON string, kept for DB compat)
 
-To reset the database: drop the six tables and restart the server — it will re-seed from `server_data/*.json` on the next startup (or fall back to DEFAULT_FORUMS if the JSON files are absent).
+To reset the database: drop the seven tables (users, forums, topics, posts, dms, settings, voice_channels) and restart the server — it will re-seed from `server_data/*.json` on the next startup (or fall back to DEFAULT_FORUMS if the JSON files are absent).
 
 ## Clients
 
@@ -103,7 +106,7 @@ Only the first `create_dev_account` WebSocket message succeeds (no prior admin e
 
 ## Resetting state
 
-Drop the six tables (users, forums, topics, posts, dms, settings) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup (or fall back to DEFAULT_FORUMS if the JSON files are absent).
+Drop the seven tables (users, forums, topics, posts, dms, settings, voice_channels) from the database and restart the server. It will re-seed from `server_data/*.json` on the next startup (or fall back to DEFAULT_FORUMS if the JSON files are absent).
 
 ## Security notes (v3.0.1)
 
