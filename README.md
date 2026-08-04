@@ -1,6 +1,6 @@
 # Chatwisp
 
-A real-time chat application with forums, direct messages, and admin management. WebSocket-based with Python server and both web and Windows clients.
+A real-time chat application with forums, direct messages, and admin management. WebSocket-based with Python server and web, Windows, and Linux clients.
 
 ## Quick Start
 
@@ -36,8 +36,9 @@ Only the first such message succeeds (no prior admin exists).
 
 - **Web client**: open `http://your-server:8765/` in any browser (server serves `client_web/`).
 - **Windows client**: `pip install wxPython && python client_windows.py`.
+- **Linux client**: `pip install websockets && python3 client_linux.py` (terminal / curses TUI).
 
-Both clients default to `wss://chatwisp.onrender.com` — override the URL on the login screen to point to your server.
+All clients default to `wss://chatwisp.onrender.com` — override the URL on the login screen to point to your server.
 
 ### Connect to the central server
 
@@ -88,6 +89,37 @@ The server serves 5 royalty-free MP3s from the `/music/` endpoint. Music was rem
 
 - **`main`** — Working branch deployed to the central server at Render.
 - **`source`** — Mirrors `main` after stable releases for public consumption.
+
+## Linux client
+
+A native terminal client (`client_linux.py`) is provided for Linux users. It is
+a curses-based TUI that speaks the same WebSocket protocol as the Windows client,
+so Linux, Windows and web users all share the same forums, topics, posts and
+direct messages.
+
+```bash
+pip install websockets          # only third-party dependency
+python3 client_linux.py
+```
+
+It works in any terminal (including over SSH) and is screen-reader friendly:
+status announcements are spoken through `spd-say`/`espeak`/`espeak-ng` when
+available, mirroring the Windows client's NVDA/SAPI accessibility support.
+
+| Key | Action |
+|---|---|
+| ↑/↓ or j/k | Move selection |
+| Enter | Open / activate |
+| Esc / Backspace | Go back |
+| r | Reply to a topic · i | Type a message / edit |
+| m | Messages · s | Settings · n | New message |
+| F1 | Server uptime · F2 | Ping |
+| q | Quit (from main menu) |
+
+Sign in with a username/password, or choose "Sign in with christmaschild Account"
+to use OAuth. The full admin panel (accounts, ban/unban, promote/demote, reset
+password, set MOTD, official-account actions) and topic moderation (close /
+reopen / delete / admin-only / delete post) are supported.
 
 ## Development
 
