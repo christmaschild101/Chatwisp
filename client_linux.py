@@ -1,244 +1,500 @@
 #!/usr/bin/env python3
 """
-Chatwisp — Linux client (curses TUI).
+Chatwisp — Linux GUI client (wxPython).
 
-A terminal user interface for the Chatwisp chat server. It speaks the exact
-same WebSocket protocol as the Windows client (client_windows.py), so it is
-fully interoperable: a Linux user can connect to the same servers and share
-forums, topics, posts and direct messages with Windows and web users.
+A desktop GUI for the Chatwisp chat server. It is layout- and
+feature-identical to the Windows client (client_windows.py) and speaks the
+same WebSocket protocol, so Linux users share forums, topics, posts and direct
+messages with Windows and web users.
+
+A curses terminal client (client_linux_curses.py) is also provided for
+SSH/headless use.
 
 Requirements:
-    pip install websockets        # the only third-party dependency
+    pip install wxPython websockets
 
 Usage:
     python3 client_linux.py
-
-Run on any Linux terminal (works over SSH too). Screen reader friendly:
-status announcements are spoken via espeak/spd-say when available, mirroring
-the Windows client's NVDA/SAPI accessibility support.
 """
+import wx
 
 VERSION = "4.1.0"
 DEFAULT_URI = "wss://chatwisp.onrender.com"
 AUTH_SERVER_URL = "https://christmaschild-auth.onrender.com"
-
 import json
 import threading
 import queue
 import sys
 import os
 import time
-import curses
-import curses.textpad
-import textwrap
-import subprocess
 import shutil
-import random
-import secrets
+import subprocess
 import urllib.request
 import urllib.parse
 import http.server
 import webbrowser
+import random
+import secrets as _secrets
+
+try:
+    import websockets.sync.client
+    HAS_WEBSOCKETS = True
+except ImportError:
+    HAS_WEBSOCKETS = False
+
+if getattr(sys, 'frozen', False):
+    _BASE_DIR = sys._MEIPASS
+else:
+    _BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# --------------------------------------------------------------------------- #
-#  Optional third-party dependency (lazy import so the module loads without it)
-# --------------------------------------------------------------------------- #
-_ws_module = None
+class ChatwispFrame(wx.Frame):
+    def __init__(self):
+        super().__init__(None, title=f"Chatwisp version {VERSION}", size=(800, 600))
+        self.SetMinSize((600, 400))
 
+        self.statusbar = self.CreateStatusBar()
+        self.statusbar.SetStatusText("Welcome to Chatwisp")
 
-def _get_websockets():
-    global _ws_module
-    if _ws_module is None:
-        import importlib
-        _ws_module = importlib.import_module("websockets.sync.client")
-    return _ws_module
+        self.main_panel = wx.Panel(self)
+        self.main_sizer = wx.BoxSizer(wx.VERTICAL)
+        self.main_panel.SetSizer(self.main_sizer)
 
-
-def websockets_available():
-    try:
-        _get_websockets()
-        return True
-    except Exception:
-        return False
-
-
-# --------------------------------------------------------------------------- #
-#  Text-to-speech (accessibility), Linux equivalent of the Windows NVDA/SAPI
-# --------------------------------------------------------------------------- #
-def _tts_speak(text):
-    if not text:
-        return
-    for exe in ("spd-say", "espeak-ng", "espeak"):
-        path = shutil.which(exe)
-        if path:
-            try:
-                subprocess.Popen(
-                    [path, text],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    close_fds=True,
-                )
-                return
-            except Exception:
-                continue
-
-
-# --------------------------------------------------------------------------- #
-#  Helpers
-# --------------------------------------------------------------------------- #
-def _safe_str(v):
-    if v is None:
-        return ""
-    return str(v)
-
-
-def _confirm(stdscr, prompt):
-    """Yes/No confirm dialog. Returns True for yes."""
-    stdscr.addstr(curses.LINES - 2, 0, " " * (curses.COLS - 1))
-    stdscr.addstr(curses.LINES - 2, 0, prompt[: curses.COLS - 1], curses.A_BOLD)
-    stdscr.clrtoeol()
-    curses.echo()
-    curses.curs_set(1)
-    stdscr.nodelay(False)
-    while True:
-        try:
-            ch = stdscr.getch(curses.LINES - 2, min(len(prompt), curses.COLS - 2))
-        except curses.error:
-            ch = -1
-        curses.noecho()
-        curses.curs_set(0)
-        if ch in (ord("y"), ord("Y")):
-            return True
-        if ch in (ord("n"), ord("N"), 27, curses.KEY_CANCEL):
-            return False
-        if ch in (10, 13):
-            return True
-        # redraw prompt and wait again
-        stdscr.addstr(curses.LINES - 2, 0, " " * (curses.COLS - 1))
-        stdscr.addstr(curses.LINES - 2, 0, prompt[: curses.COLS - 1], curses.A_BOLD)
-        stdscr.clrtoeol()
-
-
-def _prompt(stdscr, label, initial="", secret=False, max_len=200):
-    """Single-line text prompt. Returns entered string or None on Esc."""
-    h, w = stdscr.getmaxyx()
-    row = h - 2
-    buf = list(initial)
-    curses.curs_set(1)
-    stdscr.nodelay(False)
-    while True:
-        stdscr.addstr(row, 0, " " * (w - 1))
-        disp = "".join(buf)
-        if secret:
-            disp = "*" * len(disp)
-        stdscr.addstr(row, 0, label[: w - len(disp) - 2] + " " + disp)
-        stdscr.clrtoeol()
-        col = min(len(label) + 1 + len(buf), w - 2)
-        try:
-            ch = stdscr.getch(row, col)
-        except curses.error:
-            ch = -1
-        if ch in (10, 13):
-            curses.curs_set(0)
-            return "".join(buf)
-        if ch in (27, curses.KEY_CANCEL):
-            curses.curs_set(0)
-            return None
-        if ch in (curses.KEY_BACKSPACE, 8, 127):
-            if buf:
-                buf.pop()
-        elif ch == curses.KEY_RESIZE:
-            h, w = stdscr.getmaxyx()
-        elif 32 <= ch <= 126 and len(buf) < max_len:
-            buf.append(chr(ch))
-
-
-# --------------------------------------------------------------------------- #
-#  Application
-# --------------------------------------------------------------------------- #
-class ChatwispApp:
-    def __init__(self, stdscr=None):
-        # connection / auth state
-        self.stdscr = stdscr
         self.ws = None
         self.connected = False
-        self.running = True
         self.username = None
         self.is_admin = False
         self.is_super_admin = False
-        self._server_uri = DEFAULT_URI
-        self._saved_uri = None
-        self._saved_username = None
-        self._saved_password = None
-        self._reconnecting = False
-        self._last_ping_time = 0.0
-        self._pending_ping_time = 0.0
-        self._pending_server_info = False
-        self._ccauth_token = None
-
-        # queues: networking thread -> main thread
-        self.recv_queue = queue.Queue()
-
-        # data caches
-        self.forums = []
-        self.topics = []
-        self.posts = []
-        self.current_topic = None
-        self.users = []
-        self.dm_contacts = []
-        self.dm_messages = []
-        self.dm_contact = None
-        self.signature = ""
         self.unread_count = 0
-        self.motd = ""
-
-        # navigation stacks (kept in the client so the dispatch can re-request)
+        self.dm_contact = None
+        self.current_topic_data = None
         self.forum_id_stack = []
         self.topic_id_stack = []
+        self.current_view = None
 
-        # UI state
-        self.view_stack = []
-        self.view = None
-        self.status = "Welcome to Chatwisp"
-        self.dirty = True
-        self.input_buf = ""
-        self.input_label = ""
-        self.input_active = False
-        self.scroll = 0
-        self.cursor = 0  # selected display line within current view
-        self._lines = []  # display lines for the current view
-        self._line_meta = []  # parallel metadata (e.g. post index) per display line
+        self.recv_queue = queue.Queue()
+        self.send_queue = queue.Queue()
+        self.running = True
 
-    # ------------------------------------------------------------------ #
-    #  Networking
-    # ------------------------------------------------------------------ #
-    def _send(self, msg):
-        if not self.connected or not self.ws:
-            self._set_status("Not connected")
+        self.view_panel = None
+        self._pending_ping_time = 0
+        self._pending_server_info = False
+        self._saved_username = None
+        self._saved_password = None
+        self._saved_uri = None
+        self._reconnecting = False
+        self._last_ping_time = 0
+        self.recv_timer = wx.Timer(self)
+        self.Bind(wx.EVT_TIMER, self.on_poll_recv, self.recv_timer)
+
+        self.ID_NEW = wx.NewIdRef()
+        self.ID_CLOSE = wx.NewIdRef()
+        self.ID_REOPEN = wx.NewIdRef()
+        accel = wx.AcceleratorTable([
+            (wx.ACCEL_CTRL, ord('N'), self.ID_NEW),
+            (wx.ACCEL_CTRL, ord('K'), self.ID_CLOSE),
+            (wx.ACCEL_CTRL, ord('O'), self.ID_REOPEN),
+        ])
+        self.SetAcceleratorTable(accel)
+        self.Bind(wx.EVT_MENU, self.on_ctrl_n, id=self.ID_NEW)
+        self.Bind(wx.EVT_MENU, self.on_ctrl_k, id=self.ID_CLOSE)
+        self.Bind(wx.EVT_MENU, self.on_ctrl_o, id=self.ID_REOPEN)
+        self.Bind(wx.EVT_CHAR_HOOK, self.on_char_hook)
+
+        self.show_server_select()
+        self.recv_timer.Start(100)
+
+    def announce(self, message):
+        self.statusbar.SetStatusText(message)
+
+    def _tts_speak(self, text):
+        # Linux accessibility: spd-say / espeak-ng / espeak (no NVDA/SAPI).
+        if not text:
             return
+        for exe in ("spd-say", "espeak-ng", "espeak"):
+            path = shutil.which(exe)
+            if path:
+                try:
+                    subprocess.Popen(
+                        [path, text],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        close_fds=True,
+                    )
+                    return
+                except Exception:
+                    continue
+
+    def switch_view(self, view_panel):
+        self.main_sizer.Clear(delete_windows=False)
+        if self.view_panel:
+            self.view_panel.Destroy()
+        self.view_panel = view_panel
+        self.main_sizer.Add(view_panel, 1, wx.EXPAND)
+        self.main_panel.Layout()
+        view_panel.SetFocus()
+
+    # --- Server Selection ---
+
+    def show_server_select(self):
+        self.current_view = "server_select"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Chatwisp - Select Server")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 4); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
+        sz.AddStretchSpacer()
+
+        central_btn = wx.Button(pnl, label="Connect to Central Server")
+        central_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_login(DEFAULT_URI))
+        sz.Add(central_btn, 0, wx.LEFT | wx.RIGHT, 40)
+        sz.AddSpacer(10)
+
+        ext_label = wx.StaticText(pnl, label="Or connect to your own server:")
+        sz.Add(ext_label, 0, wx.LEFT | wx.RIGHT, 40)
+        sz.AddSpacer(5)
+
+        ext_btn = wx.Button(pnl, label="Connect to External Server")
+        ext_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_external_server())
+        sz.Add(ext_btn, 0, wx.LEFT | wx.RIGHT, 40)
+
+        sz.AddStretchSpacer()
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        central_btn.SetFocus()
+        self.announce("Server selection. Connect to central server or an external server.")
+
+    def show_external_server(self):
+        self.current_view = "external_server"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="External Server")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 4); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
+        sz.AddSpacer(15)
+
+        gs = wx.FlexGridSizer(3, 2, 8, 15)
+        gs.AddGrowableCol(1)
+
+        gs.Add(wx.StaticText(pnl, label="Server Address:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
+        self.server_host = wx.TextCtrl(pnl, value="127.0.0.1")
+        gs.Add(self.server_host, 0, wx.EXPAND | wx.RIGHT, 20)
+
+        gs.Add(wx.StaticText(pnl, label="Port:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
+        self.server_port = wx.TextCtrl(pnl, value="8765")
+        gs.Add(self.server_port, 0, wx.EXPAND | wx.RIGHT, 20)
+
+        sz.Add(gs, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 10)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        connect_btn = wx.Button(pnl, label="Connect")
+        connect_btn.Bind(wx.EVT_BUTTON, self._on_external_connect)
+        btn_sz.Add(connect_btn, 0, wx.RIGHT, 8)
+
+        back_btn = wx.Button(pnl, label="Back")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_server_select())
+        btn_sz.Add(back_btn, 0, wx.LEFT, 8)
+
+        sz.Add(btn_sz, 0, wx.LEFT, 20)
+        sz.AddStretchSpacer()
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.server_host.SetFocus()
+        self.announce("Enter external server address and port.")
+
+    def _on_external_connect(self, event):
+        host = self.server_host.GetValue().strip()
+        port = self.server_port.GetValue().strip()
+        if not host or not port:
+            wx.MessageBox("Please enter a server address and port", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        uri = f"ws://{host}:{port}"
+        self.show_login(uri)
+
+    # --- Login View ---
+
+    def show_login(self, uri=None):
+        if uri is None:
+            uri = DEFAULT_URI
+        self._server_uri = uri
+        self.current_view = "login"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Chatwisp - Login / Register")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 4); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.TOP | wx.LEFT | wx.RIGHT, 25)
+        sz.AddSpacer(15)
+
+        server_label = wx.StaticText(pnl, label=f"Server: {uri}")
+        sz.Add(server_label, 0, wx.LEFT | wx.RIGHT, 25)
+        sz.AddSpacer(10)
+
+        gs = wx.FlexGridSizer(2, 2, 8, 15)
+        gs.AddGrowableCol(1)
+
+        gs.Add(wx.StaticText(pnl, label="Username:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
+        self.login_user = wx.TextCtrl(pnl)
+        gs.Add(self.login_user, 0, wx.EXPAND | wx.RIGHT, 20)
+
+        gs.Add(wx.StaticText(pnl, label="Password:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 20)
+        self.login_pass = wx.TextCtrl(pnl, style=wx.TE_PASSWORD)
+        gs.Add(self.login_pass, 0, wx.EXPAND | wx.RIGHT, 20)
+
+        sz.Add(gs, 0, wx.EXPAND | wx.TOP | wx.BOTTOM, 10)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        self.login_btn = wx.Button(pnl, label="Login")
+        self.login_btn.Bind(wx.EVT_BUTTON, self.on_login)
+        btn_sz.Add(self.login_btn, 0, wx.RIGHT, 8)
+
+        self.register_btn = wx.Button(pnl, label="Register")
+        self.register_btn.Bind(wx.EVT_BUTTON, self.on_register)
+        btn_sz.Add(self.register_btn, 0, wx.LEFT, 8)
+
+        sz.Add(btn_sz, 0, wx.LEFT, 20)
+        sz.AddSpacer(15)
+
+        sep = wx.StaticLine(pnl)
+        sz.Add(sep, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+        sz.AddSpacer(10)
+
+        self.ccauth_btn = wx.Button(pnl, label="Sign in with christmaschild Account")
+        self.ccauth_btn.SetBackgroundColour(wx.Colour(44, 62, 80))
+        self.ccauth_btn.SetForegroundColour(wx.WHITE)
+        self.ccauth_btn.Bind(wx.EVT_BUTTON, self.on_ccauth_login)
+        sz.Add(self.ccauth_btn, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 20)
+
+        sz.AddStretchSpacer()
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.login_user.SetFocus()
+        self.announce(f"Login screen. Server: {uri}. Enter your username and password.")
+
+    def on_login(self, event):
+        self._do_auth("login")
+
+    def on_register(self, event):
+        username = self.login_user.GetValue().strip()
+        password = self.login_pass.GetValue()
+        if not username or not password:
+            wx.MessageBox("Username and password required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        if len(username) < 3:
+            wx.MessageBox("Username must be at least 3 characters", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        if len(password) < 8:
+            wx.MessageBox("Password must be at least 8 characters", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._do_auth("register")
+
+    def on_ccauth_login(self, event):
+        self.ccauth_btn.Disable()
+        self.login_btn.Disable()
+        self.register_btn.Disable()
+        self.announce("Opening browser for christmaschild authentication...")
+        threading.Thread(target=self._ccauth_oauth_flow, daemon=True).start()
+
+    def _ccauth_oauth_flow(self):
+        token_container = [None]
+        state = _secrets.token_urlsafe(32)
+        port = random.randint(20000, 60000)
+
+        class CallbackHandler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, format, *args):
+                pass
+            def do_GET(self):
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/callback":
+                    params = urllib.parse.parse_qs(parsed.query)
+                    code = params.get("code", [""])[0]
+                    cb_state = params.get("state", [""])[0]
+                    if cb_state != state:
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"State mismatch. Please try again.")
+                        return
+                    if not code:
+                        self.send_response(400)
+                        self.end_headers()
+                        self.wfile.write(b"Missing authorization code.")
+                        return
+                    try:
+                        data = json.dumps({"code": code}).encode("utf-8")
+                        req = urllib.request.Request(
+                            f"{AUTH_SERVER_URL}/api/auth/token",
+                            data=data,
+                            headers={"Content-Type": "application/json"},
+                            method="POST"
+                        )
+                        with urllib.request.urlopen(req, timeout=15) as resp:
+                            result = json.loads(resp.read().decode("utf-8"))
+                        token_container[0] = result.get("token")
+                        self.send_response(200)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(b"<html><body><h2>Authentication successful!</h2><p>You may close this window and return to Chatwisp.</p></body></html>")
+                    except Exception as e:
+                        self.send_response(500)
+                        self.send_header("Content-Type", "text/html; charset=utf-8")
+                        self.end_headers()
+                        self.wfile.write(f"<html><body><h2>Authentication failed</h2><p>{e}</p></body></html>".encode("utf-8"))
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+            def do_OPTIONS(self):
+                self.send_response(200)
+                self.end_headers()
+
+        server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
+        server.timeout = 120
+        redirect_uri = f"http://127.0.0.1:{port}/callback"
+        auth_url = (
+            f"{AUTH_SERVER_URL}/api/auth/authorize"
+            f"?service=chatwisp"
+            f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
+            f"&state={urllib.parse.quote(state, safe='')}"
+        )
+        wx.CallAfter(webbrowser.open, auth_url)
+        self.announce("Waiting for authentication in browser...")
+        while token_container[0] is None:
+            server.handle_request()
+            if token_container[0] is not None:
+                break
+        server.server_close()
+        token = token_container[0]
+        if token:
+            wx.CallAfter(self._on_ccauth_token_received, token)
+        else:
+            wx.CallAfter(self._ccauth_login_failed, "Authentication failed or was cancelled.")
+
+    def _on_ccauth_token_received(self, token):
+        self._ccauth_token = token
+        self._server_uri = self._server_uri or DEFAULT_URI
+        uri = self._server_uri
+        self.announce(f"Connecting to {uri}...")
+        threading.Thread(
+            target=self._ccauth_ws_connect,
+            args=(uri, token),
+            daemon=True
+        ).start()
+
+    def _ccauth_ws_connect(self, uri, token):
         try:
-            self.ws.send(json.dumps(msg))
+            with websockets.sync.client.connect(uri) as ws:
+                self.ws = ws
+                self.connected = True
+                ws.send(json.dumps({"type": "login_ccauth", "token": token, "client_version": VERSION}))
+                response = json.loads(ws.recv())
+                if response.get("type") == "login_success":
+                    self._saved_username = response["username"]
+                    self.username = response["username"]
+                    self.is_admin = response.get("is_admin", False)
+                    self.is_super_admin = response.get("super_admin", False)
+                    self.recv_queue.put(("auth_success", response))
+                    self._ws_recv_loop(ws)
+                elif response.get("type") == "ccauth_new_user":
+                    wx.CallAfter(self._on_ccauth_new_user, response.get("email", ""), token)
+                    ws.close()
+                else:
+                    self.recv_queue.put(("auth_error", response.get("message", "Authentication failed")))
+                    ws.close()
         except Exception as e:
             self.recv_queue.put(("connection_error", str(e)))
 
-    def _connect(self, uri, username, password, mode):
-        """mode: 'login' or 'register'. Runs in a background thread."""
+    def _on_ccauth_new_user(self, email, token):
+        self._ccauth_token = token
+        self.ccauth_btn.Enable()
+        self.login_btn.Enable()
+        self.register_btn.Enable()
+        dlg = wx.TextEntryDialog(
+            self,
+            f"Choose a username for your new account.\nYour christmaschild email: {email}",
+            "Create Account",
+            "",
+            wx.OK | wx.CANCEL
+        )
+        if dlg.ShowModal() == wx.ID_OK:
+            username = dlg.GetValue().strip()
+            dlg.Destroy()
+            if len(username) < 3:
+                wx.MessageBox("Username must be at least 3 characters", "Error", wx.OK | wx.ICON_ERROR)
+                return
+            self.login_btn.Disable()
+            self.register_btn.Disable()
+            self.ccauth_btn.Disable()
+            threading.Thread(
+                target=self._ccauth_register,
+                args=(self._server_uri or DEFAULT_URI, token, username),
+                daemon=True
+            ).start()
+        else:
+            dlg.Destroy()
+
+    def _ccauth_register(self, uri, token, username):
         try:
-            ws_mod = _get_websockets()
-            with ws_mod.connect(uri) as ws:
-                self.ws = ws
-                self.connected = True
+            with websockets.sync.client.connect(uri) as ws:
                 ws.send(json.dumps({
-                    "type": mode, "username": username, "password": password,
-                    "client_version": VERSION,
+                    "type": "complete_ccauth_registration",
+                    "token": token,
+                    "username": username,
+                    "client_version": VERSION
                 }))
                 response = json.loads(ws.recv())
-                rtype = response.get("type")
-                if rtype == "login_success":
-                    self._on_login_success(response)
-                    self._recv_loop(ws)
-                elif rtype == "register_success":
+                if response.get("type") == "login_success":
+                    self._saved_username = response["username"]
+                    self.username = response["username"]
+                    self.is_admin = response.get("is_admin", False)
+                    self.is_super_admin = response.get("super_admin", False)
+                    self.recv_queue.put(("auth_success", response))
+                    self._ws_recv_loop(ws)
+                else:
+                    self.recv_queue.put(("auth_error", response.get("message", "Registration failed")))
+                    ws.close()
+        except Exception as e:
+            self.recv_queue.put(("connection_error", str(e)))
+
+    def _ccauth_login_failed(self, msg):
+        self.ccauth_btn.Enable()
+        self.login_btn.Enable()
+        self.register_btn.Enable()
+        wx.MessageBox(msg, "Authentication Error", wx.OK | wx.ICON_ERROR)
+        self.announce("Authentication failed")
+
+    def _do_auth(self, mode):
+        username = self.login_user.GetValue().strip()
+        password = self.login_pass.GetValue()
+        if not username or not password:
+            wx.MessageBox("Username and password required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self.login_btn.Disable()
+        self.register_btn.Disable()
+        uri = self._server_uri
+        self.announce(f"Connecting to {uri}...")
+        self._saved_uri = uri
+        threading.Thread(target=self._ws_connect, args=(uri, username, password, mode), daemon=True).start()
+
+    def _ws_connect(self, uri, username, password, mode):
+        try:
+            with websockets.sync.client.connect(uri) as ws:
+                self.ws = ws
+                self.connected = True
+                ws.send(json.dumps({"type": mode, "username": username, "password": password, "client_version": VERSION}))
+                response = json.loads(ws.recv())
+                if response.get("type") == "login_success":
+                    self._saved_username = response["username"]
+                    self._saved_password = password
+                    self.username = response["username"]
+                    self.is_admin = response.get("is_admin", False)
+                    self.is_super_admin = response.get("super_admin", False)
+                    self.recv_queue.put(("auth_success", response))
+                    self._ws_recv_loop(ws)
+                elif response.get("type") == "register_success":
                     self.recv_queue.put(("register_ok", response))
                     ws.close()
                 else:
@@ -247,20 +503,10 @@ class ChatwispApp:
         except Exception as e:
             self.recv_queue.put(("connection_error", str(e)))
 
-    def _on_login_success(self, response):
-        self._saved_username = response.get("username", self._saved_username)
-        self._saved_password = self._saved_password
-        self.username = response.get("username")
-        self.is_admin = response.get("is_admin", False)
-        self.is_super_admin = response.get("super_admin", False)
-
-    def _recv_loop(self, ws):
+    def _ws_recv_loop(self, ws):
         try:
             for raw in ws:
-                try:
-                    data = json.loads(raw)
-                except Exception:
-                    continue
+                data = json.loads(raw)
                 self.recv_queue.put(("message", data))
         except Exception:
             if self.running:
@@ -271,19 +517,18 @@ class ChatwispApp:
             if not self.running:
                 return
             try:
-                ws_mod = _get_websockets()
-                with ws_mod.connect(self._saved_uri) as ws:
-                    ws.send(json.dumps({
-                        "type": "login", "username": self._saved_username,
-                        "password": self._saved_password, "client_version": VERSION,
-                    }))
+                with websockets.sync.client.connect(self._saved_uri) as ws:
+                    ws.send(json.dumps({"type": "login", "username": self._saved_username, "password": self._saved_password, "client_version": VERSION}))
                     response = json.loads(ws.recv())
                     if response.get("type") == "login_success":
                         self.ws = ws
                         self.connected = True
-                        self._on_login_success(response)
+                        self._saved_username = response["username"]
+                        self.username = response["username"]
+                        self.is_admin = response.get("is_admin", False)
+                        self.is_super_admin = response.get("super_admin", False)
                         self.recv_queue.put(("reconnected", response))
-                        self._recv_loop(ws)
+                        self._ws_recv_loop(ws)
                         return
                     ws.close()
             except Exception:
@@ -291,138 +536,22 @@ class ChatwispApp:
             time.sleep(3)
         self.recv_queue.put(("reconnect_failed", None))
 
-    # --- christmaschild OAuth login ------------------------------------- #
-    def start_ccauth(self):
-        threading.Thread(target=self._ccauth_flow, daemon=True).start()
-        self._set_status("Opening browser for christmaschild authentication...")
-
-    def _ccauth_flow(self):
-        token_container = [None]
-        state = secrets.token_urlsafe(32)
-        port = random.randint(20000, 60000)
-
-        class CallbackHandler(http.server.BaseHTTPRequestHandler):
-            def log_message(self, fmt, *args):
-                pass
-
-            def do_GET(self):
-                parsed = urllib.parse.urlparse(self.path)
-                if parsed.path != "/callback":
-                    self.send_response(404)
-                    self.end_headers()
-                    return
-                params = urllib.parse.parse_qs(parsed.query)
-                code = params.get("code", [""])[0]
-                cb_state = params.get("state", [""])[0]
-                if cb_state != state or not code:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"State mismatch or missing code. Please try again.")
-                    return
+    def on_poll_recv(self, event):
+        try:
+            while True:
+                msg = self.recv_queue.get_nowait()
                 try:
-                    req = urllib.request.Request(
-                        f"{AUTH_SERVER_URL}/api/auth/token",
-                        data=json.dumps({"code": code}).encode("utf-8"),
-                        headers={"Content-Type": "application/json"},
-                        method="POST",
-                    )
-                    with urllib.request.urlopen(req, timeout=15) as resp:
-                        result = json.loads(resp.read().decode("utf-8"))
-                    token_container[0] = result.get("token")
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(b"<h2>Authentication successful!</h2>"
-                                     b"<p>You may close this window and return to Chatwisp.</p>")
-                except Exception as e:
-                    self.send_response(500)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.end_headers()
-                    self.wfile.write(f"Authentication failed: {e}".encode("utf-8"))
-
-            def do_OPTIONS(self):
-                self.send_response(200)
-                self.end_headers()
-
-        try:
-            server = http.server.HTTPServer(("127.0.0.1", port), CallbackHandler)
-            server.timeout = 120
-            redirect_uri = f"http://127.0.0.1:{port}/callback"
-            auth_url = (
-                f"{AUTH_SERVER_URL}/api/auth/authorize?service=chatwisp"
-                f"&redirect_uri={urllib.parse.quote(redirect_uri, safe='')}"
-                f"&state={urllib.parse.quote(state, safe='')}"
-            )
-            try:
-                webbrowser.open(auth_url)
-            except Exception:
-                pass
-            self._set_status("Waiting for authentication in browser...")
-            while token_container[0] is None and self.running:
-                server.handle_request()
-            server.server_close()
-            token = token_container[0]
-            if token:
-                self._ccauth_token = token
-                self._set_status(f"Connecting to {self._server_uri}...")
-                threading.Thread(
-                    target=self._ccauth_ws_connect,
-                    args=(self._server_uri or DEFAULT_URI, token),
-                    daemon=True,
-                ).start()
-            else:
-                self.recv_queue.put(("auth_error", "Authentication failed or was cancelled."))
-        except Exception as e:
-            self.recv_queue.put(("connection_error", str(e)))
-
-    def _ccauth_ws_connect(self, uri, token):
-        try:
-            ws_mod = _get_websockets()
-            with ws_mod.connect(uri) as ws:
-                self.ws = ws
-                self.connected = True
-                ws.send(json.dumps({"type": "login_ccauth", "token": token, "client_version": VERSION}))
-                response = json.loads(ws.recv())
-                rtype = response.get("type")
-                if rtype == "login_success":
-                    self._on_login_success(response)
-                    self.recv_queue.put(("auth_success", response))
-                    self._recv_loop(ws)
-                elif rtype == "ccauth_new_user":
-                    self.recv_queue.put(("ccauth_new_user", response))
-                    ws.close()
-                else:
-                    self.recv_queue.put(("auth_error", response.get("message", "Authentication failed")))
-                    ws.close()
-        except Exception as e:
-            self.recv_queue.put(("connection_error", str(e)))
-
-    def _ccauth_register(self, username):
-        token = self._ccauth_token
-        uri = self._server_uri or DEFAULT_URI
-        self._set_status(f"Creating account {username}...")
-        try:
-            ws_mod = _get_websockets()
-            with ws_mod.connect(uri) as ws:
-                ws.send(json.dumps({
-                    "type": "complete_ccauth_registration",
-                    "token": token, "username": username, "client_version": VERSION,
-                }))
-                response = json.loads(ws.recv())
-                if response.get("type") == "login_success":
-                    self._on_login_success(response)
-                    self.recv_queue.put(("auth_success", response))
-                    self._recv_loop(ws)
-                else:
-                    self.recv_queue.put(("auth_error", response.get("message", "Registration failed")))
-                    ws.close()
-        except Exception as e:
-            self.recv_queue.put(("connection_error", str(e)))
-
-    # ------------------------------------------------------------------ #
-    #  Keepalive
-    # ------------------------------------------------------------------ #
-    def _maybe_keepalive(self):
+                    self._handle_recv(msg)
+                except Exception as exc:
+                    import traceback
+                    err_msg = f"Internal error handling {msg[0]}: {exc}\n{traceback.format_exc()}"
+                    print(err_msg)
+                    try:
+                        wx.CallAfter(wx.MessageBox, err_msg, "Unexpected Error", wx.OK | wx.ICON_ERROR)
+                    except Exception:
+                        pass
+        except queue.Empty:
+            pass
         if self.connected and self.ws and time.time() - self._last_ping_time >= 30:
             self._last_ping_time = time.time()
             try:
@@ -430,176 +559,173 @@ class ChatwispApp:
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------ #
-    #  Inbound message handling (runs in the main/UI thread while draining)
-    # ------------------------------------------------------------------ #
-    def _drain_recv(self):
-        drained = False
-        while True:
-            try:
-                msg = self.recv_queue.get_nowait()
-            except queue.Empty:
-                break
-            drained = True
-            try:
-                self._handle_recv(msg)
-            except Exception as e:
-                self._set_status(f"Internal error: {e}")
-        if drained:
-            self.dirty = True
-
     def _handle_recv(self, msg):
-        mtype, data = msg[0], msg[1]
-        if mtype == "connection_error":
-            self._set_status(f"Could not connect: {data}")
-            self._show_alert(f"Could not connect: {data}")
-        elif mtype == "auth_error":
-            self._set_status(_safe_str(data) or "Authentication failed")
-            self._show_alert(_safe_str(data) or "Authentication failed")
-        elif mtype == "register_ok":
-            self._set_status("Registration successful! You can now log in.")
-            self._show_alert("Registration successful! You can now log in.")
-        elif mtype == "auth_success":
-            self._set_status(f"Welcome, {self.username}!")
-            self.show_forums_view()
-        elif mtype == "ccauth_new_user":
-            self._handle_ccauth_new_user(data)
-        elif mtype == "reconnected":
+        msg_type = msg[0]
+        data = msg[1]
+
+        if msg_type == "connection_error":
+            wx.CallAfter(self._enable_login_buttons)
+            wx.MessageBox(f"Could not connect: {data}", "Connection Error", wx.OK | wx.ICON_ERROR)
+            self.announce("Connection failed")
+            return
+
+        if msg_type == "auth_error":
+            wx.CallAfter(self._enable_login_buttons)
+            wx.MessageBox(data, "Login Error", wx.OK | wx.ICON_ERROR)
+            self.announce("Authentication failed")
+            return
+
+        if msg_type == "register_ok":
+            wx.CallAfter(self._enable_login_buttons)
+            wx.MessageBox("Registration successful! You can now log in.", "Success", wx.OK | wx.ICON_INFORMATION)
+            self.announce("Registration successful")
+            return
+
+        if msg_type == "auth_success":
+            wx.CallAfter(self._enable_login_buttons)
+            self.announce(f"Welcome, {self.username}!")
+            self.show_main_menu()
+            return
+
+        if msg_type == "reconnected":
             self._reconnecting = False
-            self._set_status("Reconnected!")
-            self.show_forums_view()
-        elif mtype == "reconnect_failed":
+            self.announce("Reconnected!")
+            wx.CallAfter(self.show_main_menu)
+            return
+
+        if msg_type == "reconnect_failed":
             self._reconnecting = False
             self._saved_username = None
             self._saved_password = None
-            self._show_alert("Could not reconnect to server. Returning to login.")
-            self.show_server_select()
-        elif mtype == "disconnected":
+            wx.MessageBox("Could not reconnect to server. Returning to login.", "Disconnected", wx.OK | wx.ICON_ERROR)
+            wx.CallAfter(self.show_server_select)
+            return
+
+        if msg_type == "disconnected":
             self.connected = False
             self.ws = None
-            if (self._saved_username and self._saved_password and self._saved_uri
-                    and not self._reconnecting):
+            if self._saved_username and self._saved_password and self._saved_uri and not self._reconnecting:
+                self.announce("Connection lost, reconnecting...")
                 self._reconnecting = True
-                self._set_status("Connection lost, reconnecting...")
                 threading.Thread(target=self._reconnect_thread, daemon=True).start()
             else:
-                self._show_alert("Lost connection to server")
-                self.show_server_select()
-        elif mtype == "message":
+                wx.MessageBox("Lost connection to server", "Disconnected", wx.OK | wx.ICON_ERROR)
+                wx.CallAfter(self.show_server_select)
+            return
+
+        if msg_type == "message":
             self._handle_server_message(data)
+
+    def _enable_login_buttons(self):
+        self.login_btn.Enable()
+        self.register_btn.Enable()
+        if hasattr(self, 'ccauth_btn'):
+            self.ccauth_btn.Enable()
 
     def _handle_server_message(self, data):
         dtype = data.get("type")
         if dtype == "welcome":
-            self.motd = data.get("motd", "")
-            self._set_status(data.get("message", "Welcome"))
-            self._tts(data.get("message", "Welcome"))
+            wx.MessageBox(data.get("message", ""), "Welcome", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "forums_list":
-            self.forums = data.get("forums", [])
-            self.show_forums_view()
+            self.show_forums(data["forums"])
         elif dtype == "topics_list":
-            self.topics = data.get("topics", [])
-            if not self.forum_id_stack or self.forum_id_stack[-1] != data.get("forum_id"):
-                self.forum_id_stack.append(data.get("forum_id"))
-            self.show_topics_view()
+            self.show_topics(data["forum_id"], data["topics"])
         elif dtype == "posts_list":
-            self.current_topic = data.get("topic", {})
-            self.posts = data.get("posts", [])
-            if not self.topic_id_stack or self.topic_id_stack[-1] != self.current_topic.get("id"):
-                self.topic_id_stack.append(self.current_topic.get("id"))
-            self.show_posts_view()
+            self.current_topic_data = data["topic"]
+            self.show_posts(data["topic"], data["posts"])
         elif dtype == "topic_created":
-            self._set_status("Topic created")
-            if self.forum_id_stack:
-                self._send({"type": "get_topics", "forum_id": self.forum_id_stack[-1]})
+            self.announce("Topic created")
+            if self.forum_id_stack: self._request_topics(self.forum_id_stack[-1])
         elif dtype == "post_created":
-            self._set_status("Post created")
-            if self.topic_id_stack:
-                self._send({"type": "get_posts", "topic_id": self.topic_id_stack[-1]})
+            self.announce("Post created")
+            if self.topic_id_stack: self._request_posts(self.topic_id_stack[-1])
         elif dtype == "forum_created":
-            self._set_status("Forum created")
-            self._send({"type": "get_forums"})
-        elif dtype in ("topic_closed", "topic_reopened"):
-            self._set_status("Topic " + ("closed" if dtype == "topic_closed" else "reopened"))
-            tid = data.get("topic_id")
+            self.announce("Forum created")
+            self._request_forums()
+        elif dtype == "topic_closed":
+            self.announce("Topic closed")
+            tid = data["topic_id"]
             if self.topic_id_stack and self.topic_id_stack[-1] == tid:
-                self._send({"type": "get_posts", "topic_id": tid})
+                self._request_posts(tid)
             elif self.forum_id_stack:
-                self._send({"type": "get_topics", "forum_id": self.forum_id_stack[-1]})
+                self._request_topics(self.forum_id_stack[-1])
+        elif dtype == "topic_reopened":
+            self.announce("Topic reopened")
+            tid = data["topic_id"]
+            if self.topic_id_stack and self.topic_id_stack[-1] == tid:
+                self._request_posts(tid)
+            elif self.forum_id_stack:
+                self._request_topics(self.forum_id_stack[-1])
         elif dtype == "users_list":
-            self.users = data.get("users", [])
-            self.show_accounts_view()
+            self.show_users(data["users"])
         elif dtype == "banned":
-            self._set_status(data.get("message", "User banned"))
+            self.announce(data.get("message", ""))
         elif dtype == "unbanned":
-            self._set_status(data.get("message", "User unbanned"))
+            self.announce(data.get("message", ""))
         elif dtype == "user_deleted":
-            self._set_status(data.get("message", "User deleted"))
-            self._send({"type": "get_users"})
+            self.announce(data.get("message", ""))
+            self._request_users()
         elif dtype == "promoted":
             if data.get("username") == self.username:
                 self.is_admin = True
-            self._set_status(data.get("message", "Promoted"))
-            self._show_alert(data.get("message", "Promoted"))
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Admin Promotion", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "demoted":
             if data.get("username") == self.username:
                 self.is_admin = False
-            self._set_status(data.get("message", "Demoted"))
-            self._show_alert(data.get("message", "Demoted"))
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Admin Demotion", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "motd_set":
-            self._set_status(data.get("message", "MOTD updated"))
-            self._show_alert(data.get("message", "MOTD updated"))
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "MOTD Updated", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "unread_dms":
             self.unread_count = data.get("count", 0)
-            if self.unread_count > 0:
-                self._set_status(f"You have {self.unread_count} unread message(s)")
+            self.announce(f"You have {self.unread_count} unread message{'s' if self.unread_count != 1 else ''}" if self.unread_count > 0 else "No unread messages")
         elif dtype == "dm_contacts":
-            self.dm_contacts = data.get("contacts", [])
-            self.show_dm_list_view()
+            wx.CallAfter(self.show_dm_contacts, data["contacts"])
         elif dtype == "search_results":
-            self._search_results = data.get("users", [])
-            self.show_dm_search_view()
+            wx.CallAfter(self.show_dm_search_results, data["users"])
         elif dtype == "dm_conversation":
-            self.dm_messages = data.get("messages", [])
-            self.show_dm_chat_view()
+            wx.CallAfter(self.show_dm_conversation, data["messages"])
         elif dtype == "dm_sent":
-            self._set_status("Message sent")
+            self.announce("Message sent")
             if self.dm_contact:
                 self._send({"type": "get_dm_conversation", "username": self.dm_contact})
         elif dtype == "dm_received":
-            dm = data.get("dm", {})
-            other = dm.get("recipient") if dm.get("sender") == self.username else dm.get("sender")
-            if self.view and self.view.get("name") == "dm_chat" and self.dm_contact == other:
+            dm = data["dm"]
+            other = dm["recipient"] if dm["sender"] == self.username else dm["sender"]
+            if self.current_view == "dm_chat" and self.dm_contact == other:
                 self._send({"type": "get_dm_conversation", "username": other})
                 self._send({"type": "mark_dms_read", "username": other})
             else:
                 self.unread_count += 1
-                self._set_status(f"New message from {other}")
-                self._tts(f"New message from {other}")
+                self.announce(f"New message from {other}")
         elif dtype == "post_deleted":
-            self._set_status("Post deleted")
+            self.announce("Post deleted")
             if self.topic_id_stack:
-                self._send({"type": "get_posts", "topic_id": self.topic_id_stack[-1]})
+                self._request_posts(self.topic_id_stack[-1])
         elif dtype == "topic_deleted":
-            self._set_status("Topic deleted")
-            if self.topic_id_stack:
-                self.topic_id_stack.pop()
+            self.announce("Topic deleted")
             if self.forum_id_stack:
-                self._send({"type": "get_topics", "forum_id": self.forum_id_stack[-1]})
-        elif dtype in ("topic_admin_only_set", "topic_admin_only_removed"):
-            self._set_status("Admin-only " + ("set" if dtype == "topic_admin_only_set" else "removed"))
+                self._request_topics(self.forum_id_stack[-1])
+        elif dtype == "topic_admin_only_set":
+            self.announce("Topic set to admin only")
             if self.topic_id_stack:
-                self._send({"type": "get_posts", "topic_id": self.topic_id_stack[-1]})
+                self._request_posts(self.topic_id_stack[-1])
+        elif dtype == "topic_admin_only_removed":
+            self.announce("Topic no longer admin only")
+            if self.topic_id_stack:
+                self._request_posts(self.topic_id_stack[-1])
         elif dtype == "password_reset":
-            self._set_status(data.get("message", "Password reset"))
-            self._show_alert(data.get("message", "Password reset"))
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Password Reset", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "pong":
             if self._pending_ping_time:
                 rtt = int((time.time() - self._pending_ping_time) * 1000)
                 self._pending_ping_time = 0
-                m = f"Ping complete. The ping took {rtt} milliseconds."
-                self._set_status(m)
-                self._tts(m)
+                msg = f"Ping complete. The ping took {rtt} milliseconds."
+                self.announce(msg)
+                self._tts_speak(msg)
         elif dtype == "server_info":
             if self._pending_server_info:
                 self._pending_server_info = False
@@ -609,1014 +735,1062 @@ class ChatwispApp:
                 minutes = (uptime % 3600) // 60
                 seconds = uptime % 60
                 parts = []
-                if days:
-                    parts.append(f"{days} day(s)")
-                if hours:
-                    parts.append(f"{hours} hour(s)")
-                if minutes:
-                    parts.append(f"{minutes} minute(s)")
-                parts.append(f"{seconds} second(s)")
-                m = "Server has been up for " + ", ".join(parts)
-                self._set_status(m)
-                self._tts(m)
+                if days: parts.append(f"{days} day{'s' if days != 1 else ''}")
+                if hours: parts.append(f"{hours} hour{'s' if hours != 1 else ''}")
+                if minutes: parts.append(f"{minutes} minute{'s' if minutes != 1 else ''}")
+                parts.append(f"{seconds} second{'s' if seconds != 1 else ''}")
+                msg = f"Server has been up for " + ", ".join(parts)
+                self.announce(msg)
+                self._tts_speak(msg)
         elif dtype == "bot_dm_sent":
-            self._set_status("Message sent as official account")
+            self.announce("Message sent as official account")
         elif dtype == "bot_broadcast_complete":
-            self._set_status(data.get("message", "Broadcast complete"))
-            self._show_alert(data.get("message", "Broadcast complete"))
+            self.announce(data.get("message", ""))
+            wx.MessageBox(data.get("message", ""), "Broadcast Complete", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "bot_post_created":
-            self._set_status("Post created as official account")
+            self.announce("Post created as official account")
         elif dtype == "bot_topic_created":
-            self._set_status("Topic created as official account")
+            self.announce("Topic created as official account")
             if self.forum_id_stack:
-                self._send({"type": "get_topics", "forum_id": self.forum_id_stack[-1]})
+                self._request_topics(self.forum_id_stack[-1])
         elif dtype == "signature_data":
-            self.signature = data.get("signature", "")
-            if self.view and self.view.get("name") == "settings":
-                self.input_buf = self.signature
-                self.dirty = True
+            if hasattr(self, 'sig_text'):
+                self.sig_text.SetValue(data.get("signature", ""))
+                self._on_sig_text(None)
         elif dtype == "signature_updated":
-            self._set_status("Signature saved")
-            self._show_alert("Signature updated")
+            self.announce("Signature saved")
+            wx.MessageBox("Signature updated", "Settings", wx.OK | wx.ICON_INFORMATION)
         elif dtype == "error":
-            self._show_alert(data.get("message", "Unknown error"))
-            self._set_status(f"Error: {data.get('message', '')}")
+            wx.MessageBox(data.get("message", "Unknown error"), "Error", wx.OK | wx.ICON_ERROR)
+            self.announce(f"Error: {data.get('message', '')}")
 
-    # ------------------------------------------------------------------ #
-    #  Small UI helpers
-    # ------------------------------------------------------------------ #
-    def _set_status(self, text):
-        self.status = _safe_str(text)
-        self.dirty = True
-
-    def _curs(self, on):
+    def _send(self, msg):
+        if not self.connected or not self.ws:
+            self.announce("Not connected")
+            return
         try:
-            curses.curs_set(1 if on else 0)
-        except Exception:
-            pass
+            self.ws.send(json.dumps(msg))
+        except Exception as e:
+            self.recv_queue.put(("connection_error", str(e)))
 
-    def _tts(self, text):
-        _tts_speak(text)
+    def _request_forums(self):
+        self._send({"type": "get_forums"})
 
-    def _show_alert(self, text):
-        """Show a blocking alert; the main loop pops it after a key."""
-        self._alert_text = _safe_str(text)
-        self.dirty = True
+    def _request_topics(self, forum_id):
+        self._send({"type": "get_topics", "forum_id": forum_id})
 
-    def _alert_text(self):
-        return getattr(self, "_alert_msg", None)
+    def _request_posts(self, topic_id):
+        self._send({"type": "get_posts", "topic_id": topic_id})
 
-    _alert_msg = None
+    def _request_users(self):
+        self._send({"type": "get_users"})
 
-    def _push_view(self, view):
-        self.view_stack.append(view)
-        self.view = view
-        self.scroll = 0
-        self.cursor = 0
-        self.input_buf = ""
-        self.input_active = False
-        self.input_label = ""
-        self._lines = []
-        self._line_meta = []
-        self.dirty = True
+    # --- Main Menu (Forums) ---
 
-    def _pop_view(self):
-        if len(self.view_stack) > 1:
-            self.view_stack.pop()
-            self.view = self.view_stack[-1]
-            self.scroll = 0
-            self.cursor = 0
-            self.input_active = False
-            self.dirty = True
-        else:
-            self.running = False
+    def show_main_menu(self):
+        self.current_topic_data = None
+        self.announce("Loading forums...")
+        self._request_forums()
 
-    def _home(self):
-        if self.connected:
-            self._send({"type": "get_forums"})
-        else:
-            self.show_server_select()
+    def show_forums(self, forums):
+        self.current_view = "forums"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
 
-    # ------------------------------------------------------------------ #
-    #  Views
-    # ------------------------------------------------------------------ #
-    def show_server_select(self):
-        self._push_view({"name": "server_select", "items": [
-            ("Connect to Central Server", "central"),
-            ("Connect to External Server", "external"),
-            ("Sign in with christmaschild Account", "ccauth"),
-            ("Quit", "quit"),
-        ]})
+        title = wx.StaticText(pnl, label=f"Select Forum  (logged in as {self.username})")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 3); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.ALL, 15)
 
-    def show_external_server_view(self):
-        self._push_view({"name": "external_server",
-                         "fields": [("Server address", "127.0.0.1", False),
-                                    ("Port", "8765", False)],
-                         "field": 0})
+        msg_btn = wx.Button(pnl, label="Messages")
+        msg_btn.Bind(wx.EVT_BUTTON, lambda e: self._send({"type": "get_dm_contacts"}))
+        admin_sz = wx.BoxSizer(wx.HORIZONTAL)
+        admin_sz.Add(msg_btn, 0, wx.RIGHT, 5)
+        settings_btn = wx.Button(pnl, label="Settings")
+        settings_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_settings())
+        admin_sz.Add(settings_btn, 0, wx.RIGHT, 5)
+        if self.is_admin:
+            admin_sz.Add(wx.StaticText(pnl, label="  Admin:  "), 0, wx.ALIGN_CENTER_VERTICAL)
+            accts_btn = wx.Button(pnl, label="Accounts")
+            accts_btn.Bind(wx.EVT_BUTTON, lambda e: self._request_users())
+            admin_sz.Add(accts_btn, 0, wx.RIGHT, 5)
+            new_forum_btn = wx.Button(pnl, label="New Forum")
+            new_forum_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_create_forum_dialog())
+            admin_sz.Add(new_forum_btn, 0, wx.LEFT, 5)
+            set_motd_btn = wx.Button(pnl, label="Set MOTD")
+            set_motd_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_set_motd_dialog())
+            admin_sz.Add(set_motd_btn, 0, wx.LEFT, 5)
+            bot_btn = wx.Button(pnl, label="Official Account")
+            bot_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_bot_controls())
+            admin_sz.Add(bot_btn, 0, wx.LEFT, 5)
+        sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
 
-    def show_login_view(self):
-        self._push_view({"name": "login",
-                         "fields": [("Username", "", False),
-                                    ("Password", "", True)],
-                         "field": 0})
+        list_label = wx.StaticText(pnl, label="Forums:")
+        sz.Add(list_label, 0, wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(3)
 
-    def show_forums_view(self):
-        self._push_view({"name": "forums"})
+        self.forum_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.forum_ids = []
+        for f_data in forums:
+            self.forum_list.Append(f"Forum name: {f_data['name']}, description: {f_data['description']}")
+            self.forum_ids.append(f_data["id"])
+        self.forum_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_forum_select)
+        sz.Add(self.forum_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
 
-    def show_topics_view(self):
-        self._push_view({"name": "topics"})
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if self.forum_list.GetCount() > 0:
+            self.forum_list.SetFocus()
+            self.forum_list.SetSelection(0)
+        self.announce(f"Forum list loaded. {len(forums)} forums.")
 
-    def show_posts_view(self):
-        self._push_view({"name": "posts"})
+    def _do_forum_select(self):
+        idx = self.forum_list.GetSelection()
+        if idx >= 0 and idx < len(self.forum_ids):
+            fid = self.forum_ids[idx]
+            self.forum_id_stack.append(fid)
+            self.announce("Loading topics...")
+            self._request_topics(fid)
 
-    def show_accounts_view(self):
-        self._push_view({"name": "accounts"})
+    def on_forum_select(self, event):
+        self._do_forum_select()
 
-    def show_user_detail_view(self, user):
-        self._push_view({"name": "user_detail", "user": user})
+    # --- Topics View ---
 
-    def show_dm_list_view(self):
-        self._push_view({"name": "dm_list"})
+    def show_topics(self, forum_id, topics):
+        self.current_view = "topics"
+        if not self.forum_id_stack or self.forum_id_stack[-1] != forum_id:
+            self.forum_id_stack.append(forum_id)
 
-    def show_dm_search_view(self):
-        self._push_view({"name": "dm_search", "results": getattr(self, "_search_results", [])})
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
 
-    def show_dm_chat_view(self):
-        self._push_view({"name": "dm_chat"})
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        home_btn = wx.Button(pnl, label="Home")
+        home_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        nav_sz.Add(home_btn, 0, wx.RIGHT, 5)
+        new_topic_btn = wx.Button(pnl, label="New Topic")
+        new_topic_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_create_topic_dialog())
+        nav_sz.Add(new_topic_btn, 0, wx.LEFT, 5)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
 
-    def show_settings_view(self):
-        self._push_view({"name": "settings"})
-        self.input_label = "Signature"
-        self.input_buf = self.signature
-        self._send({"type": "get_signature"})
+        if self.is_admin:
+            admin_sz = wx.BoxSizer(wx.HORIZONTAL)
+            admin_sz.Add(wx.StaticText(pnl, label="Admin:  "), 0, wx.ALIGN_CENTER_VERTICAL)
+            close_btn = wx.Button(pnl, label="Close Topic")
+            close_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_close_topic())
+            admin_sz.Add(close_btn, 0, wx.RIGHT, 5)
+            reopen_btn = wx.Button(pnl, label="Reopen Topic")
+            reopen_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_reopen_topic())
+            admin_sz.Add(reopen_btn, 0, wx.LEFT, 5)
+            delete_topic_btn = wx.Button(pnl, label="Delete Topic")
+            delete_topic_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_delete_topic())
+            admin_sz.Add(delete_topic_btn, 0, wx.LEFT, 5)
+            sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
-    def show_bot_view(self):
-        self._push_view({"name": "bot", "items": [
-            ("Send DM as Official Account", "bot_dm"),
-            ("Broadcast to All Users", "bot_broadcast"),
-            ("Create Post as Official Account", "bot_post"),
-            ("Create Topic as Official Account", "bot_topic"),
-        ]})
+        sz.Add(wx.StaticText(pnl, label="Topics:"), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(3)
 
-    def show_form_view(self, title, fields, submit_type):
-        """fields: list of (label, default, secret); submit_type identifies the action."""
-        self._push_view({"name": "form", "title": title, "fields": fields,
-                         "field": 0, "submit": submit_type})
+        self.topic_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.topic_ids = []
+        self.topic_closed = []
+        for t in topics:
+            status = " [CLOSED]" if t["closed"] else ""
+            self.topic_list.Append(f"{t['title']} by {t['author']}{status} ({t['post_count']} posts)")
+            self.topic_ids.append(t["id"])
+            self.topic_closed.append(t["closed"])
+        self.topic_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_topic_select)
+        sz.Add(self.topic_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
-    # ------------------------------------------------------------------ #
-    #  Rendering
-    # ------------------------------------------------------------------ #
-    def _build_lines(self):
-        """Populate self._lines / self._line_meta for the current view."""
-        self._lines = []
-        self._line_meta = []
-        name = self.view["name"]
-        width = max(10, getattr(curses, "COLS", 80) - 2)
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if self.topic_list.GetCount() > 0:
+            self.topic_list.SetFocus()
+            self.topic_list.SetSelection(0)
+        self.announce(f"Topics loaded. {len(topics)} topics.")
 
-        if name == "server_select":
-            for i, (label, _) in enumerate(self.view["items"]):
-                self._lines.append(f"  {i + 1}. {label}")
-                self._line_meta.append(("item", i))
-        elif name == "external_server" or name == "login" or name == "form":
-            pass  # forms render fields directly, not as _lines
-        elif name == "forums":
-            if not self.forums:
-                self._lines.append("  (no forums)")
-            for i, f in enumerate(self.forums):
-                self._lines.append(f"  {i + 1}. {f.get('name', '')}")
-                self._line_meta.append(("forum", i))
-                desc = f.get("description", "")
-                if desc:
-                    for ln in textwrap.wrap(desc, width - 4):
-                        self._lines.append("      " + ln)
-                        self._line_meta.append(("forum", i))
-        elif name == "topics":
-            if not self.topics:
-                self._lines.append("  (no topics)")
-            for i, t in enumerate(self.topics):
-                tag = " [CLOSED]" if t.get("closed") else ""
-                tag += " [ADMIN ONLY]" if t.get("admin_only") else ""
-                self._lines.append(f"  {i + 1}. {t.get('title', '')} by {t.get('author', '')}{tag} ({t.get('post_count', 0)} posts)")
-                self._line_meta.append(("topic", i))
-        elif name == "posts":
-            t = self.current_topic or {}
-            tag = " [CLOSED]" if t.get("closed") else ""
-            tag += " [ADMIN ONLY]" if t.get("admin_only") else ""
-            self._lines.append(f"Topic: {t.get('title', '')}{tag}")
-            self._line_meta.append(("header", None))
-            self._lines.append("")
-            self._line_meta.append(("header", None))
-            if not self.posts:
-                self._lines.append("  (no posts yet)")
-                self._line_meta.append(("post", None))
-            for i, p in enumerate(self.posts):
-                sig = p.get("signature")
-                body = p.get("content", "")
-                if sig:
-                    body = body + f"\n— {sig}"
-                self._lines.append(f"[{i + 1}] {p.get('author', '')} said:")
-                self._line_meta.append(("post", i))
-                for ln in textwrap.wrap(body, width - 2) or [""]:
-                    self._lines.append("  " + ln)
-                    self._line_meta.append(("post", i))
-                self._lines.append("")
-                self._line_meta.append(("post", i))
-        elif name == "accounts":
-            if not self.users:
-                self._lines.append("  (no users)")
-            for i, u in enumerate(self.users):
-                parts = [u.get("username", "")]
-                if u.get("is_admin"):
-                    parts.append("[Admin]")
-                if u.get("super_admin"):
-                    parts.append("[Super]")
-                if u.get("banned"):
-                    parts.append(f"[Banned: {u.get('ban_reason') or 'no reason'}]")
-                self._lines.append(f"  {i + 1}. " + " ".join(parts))
-                self._line_meta.append(("user", i))
-        elif name == "user_detail":
-            u = self.view["user"]
-            self._lines.append(f"Username: {u.get('username', '')}")
-            self._line_meta.append(("info", None))
-            self._lines.append(f"Admin: {'Yes' if u.get('is_admin') else 'No'}"
-                               f"  Super: {'Yes' if u.get('super_admin') else 'No'}"
-                               f"  Banned: {'Yes' if u.get('banned') else 'No'}")
-            self._line_meta.append(("info", None))
-            self._lines.append("")
-            self._line_meta.append(("info", None))
-            acts = self._user_actions(u)
-            for i, (label, _) in enumerate(acts):
-                self._lines.append(f"  {i + 1}. {label}")
-                self._line_meta.append(("action", i))
-        elif name == "dm_list":
-            if not self.dm_contacts:
-                self._lines.append("  (no conversations)")
-            for i, c in enumerate(self.dm_contacts):
-                self._lines.append(f"  {i + 1}. {c.get('username', '')}: {c.get('last_message', '')}")
-                self._line_meta.append(("dm", i))
-        elif name == "dm_search":
-            res = self.view.get("results", [])
-            if not res:
-                self._lines.append("  (type a name to search, Enter to open)")
-            for i, uname in enumerate(res):
-                self._lines.append(f"  {i + 1}. {uname}")
-                self._line_meta.append(("dmuser", i))
-        elif name == "dm_chat":
-            if not self.dm_messages:
-                self._lines.append("  (no messages yet)")
-                self._line_meta.append(("msg", None))
-            for m in self.dm_messages:
-                who = "You" if m.get("sender") == self.username else m.get("sender", "")
-                for ln in textwrap.wrap(f"{who}: {m.get('content', '')}", width - 2) or [""]:
-                    self._lines.append("  " + ln)
-                    self._line_meta.append(("msg", None))
-        elif name == "settings":
-            self._lines.append("Forum signature (appended to your posts, max 50 chars):")
-            self._line_meta.append(("info", None))
-            self._lines.append("")
-            self._line_meta.append(("info", None))
-        elif name == "bot":
-            for i, (label, _) in enumerate(self.view["items"]):
-                self._lines.append(f"  {i + 1}. {label}")
-                self._line_meta.append(("bot", i))
+    def _do_topic_select(self):
+        idx = self.topic_list.GetSelection()
+        if idx >= 0 and idx < len(self.topic_ids):
+            tid = self.topic_ids[idx]
+            self.topic_id_stack.append(tid)
+            self.announce("Loading posts...")
+            self._request_posts(tid)
 
-    def _user_actions(self, u):
-        acts = []
-        if not u.get("banned"):
-            acts.append(("Ban user", "ban"))
-        else:
-            acts.append(("Unban user", "unban"))
-        if u.get("username") != self.username:
-            acts.append(("Delete user", "delete"))
-        if self.is_super_admin and not u.get("super_admin") and u.get("username") != self.username:
-            if not u.get("is_admin"):
-                acts.append(("Promote to admin", "promote"))
+    def on_topic_select(self, event):
+        self._do_topic_select()
+
+    # --- Posts View ---
+
+    def show_posts(self, topic, posts):
+        self.current_view = "posts"
+        if not self.topic_id_stack or self.topic_id_stack[-1] != topic["id"]:
+            self.topic_id_stack.append(topic["id"])
+
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        home_btn = wx.Button(pnl, label="Home")
+        home_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        nav_sz.Add(home_btn, 0, wx.RIGHT, 5)
+        topics_btn = wx.Button(pnl, label="Back to Topics")
+        topics_btn.Bind(wx.EVT_BUTTON, lambda e: self._go_back_to_topics())
+        nav_sz.Add(topics_btn, 0, wx.LEFT, 5)
+        copy_link_btn = wx.Button(pnl, label="Copy Topic Link")
+        copy_link_btn.Bind(wx.EVT_BUTTON, lambda e: self._copy_topic_link(topic))
+        nav_sz.Add(copy_link_btn, 0, wx.LEFT, 5)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
+
+        if self.is_admin:
+            admin_sz = wx.BoxSizer(wx.HORIZONTAL)
+            admin_sz.Add(wx.StaticText(pnl, label="Admin:  "), 0, wx.ALIGN_CENTER_VERTICAL)
+            if topic["closed"]:
+                reopen_btn = wx.Button(pnl, label="Reopen Topic")
+                reopen_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_reopen_topic())
+                admin_sz.Add(reopen_btn, 0, wx.RIGHT, 5)
             else:
-                acts.append(("Demote from admin", "demote"))
-        if self.is_admin and u.get("username") != self.username:
-            acts.append(("Reset password", "resetpw"))
-        acts.append(("Back", "back"))
-        return acts
+                close_btn = wx.Button(pnl, label="Close Topic")
+                close_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_close_topic())
+                admin_sz.Add(close_btn, 0, wx.RIGHT, 5)
+            toggle_admin_only_btn = wx.Button(pnl, label="Remove Admin Only" if topic.get("admin_only") else "Make Admin Only")
+            toggle_admin_only_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_toggle_admin_only())
+            admin_sz.Add(toggle_admin_only_btn, 0, wx.RIGHT, 5)
+            delete_post_btn = wx.Button(pnl, label="Delete Selected Post")
+            delete_post_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_delete_post())
+            admin_sz.Add(delete_post_btn, 0, wx.RIGHT, 5)
+            delete_topic_btn = wx.Button(pnl, label="Delete Topic")
+            delete_topic_btn.Bind(wx.EVT_BUTTON, lambda e: self._admin_delete_topic())
+            admin_sz.Add(delete_topic_btn, 0, wx.RIGHT, 5)
+            sz.Add(admin_sz, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
 
-    def render(self):
-        if self.stdscr is None:
-            return
-        stdscr = self.stdscr
-        stdscr.erase()
-        h, w = stdscr.getmaxyx()
-        name = self.view["name"] if self.view else ""
+        status_tags = ""
+        if topic["closed"]: status_tags += " [CLOSED]"
+        if topic.get("admin_only"): status_tags += " [ADMIN ONLY]"
+        title_text = f"Topic: {topic['title']}{status_tags}"
+        sz.Add(wx.StaticText(pnl, label=title_text), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(3)
 
-        # Title
-        title = self._view_title()
-        stdscr.addstr(0, 0, title[: w - 1], curses.A_REVERSE)
-        stdscr.clrtoeol()
+        posts_label = wx.StaticText(pnl, label="Posts in this topic:")
+        sz.Add(posts_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+        sz.AddSpacer(3)
 
-        body_top = 1
-        body_bottom = h - 3  # leave room for input + status + help
-        body_h = body_bottom - body_top
-        if body_h < 1:
-            body_h = 1
+        self.posts_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.posts_data = posts
+        for p in posts:
+            display = p['content']
+            if p.get('signature'):
+                display += f"\n— {p['signature']}"
+            self.posts_list.Append(f"{p['author']} said: {display}")
+        sz.Add(self.posts_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
 
-        # Forms render fields directly
-        if name in ("login", "external_server", "form"):
-            self._render_form(stdscr, body_top, w)
+        can_reply = not topic["closed"] and (not topic.get("admin_only") or self.is_admin)
+        if can_reply:
+            sz.AddSpacer(5)
+            reply_label = wx.StaticText(pnl, label="Your reply:")
+            sz.Add(reply_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+            self.reply_text = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+            sz.Add(self.reply_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+            send_btn = wx.Button(pnl, label="Send Reply")
+            send_btn.Bind(wx.EVT_BUTTON, self.on_send_reply)
+            sz.Add(send_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 10)
+        elif topic.get("admin_only") and not self.is_admin:
+            msg = wx.StaticText(pnl, label="This topic is admin only. Only admins can post here.")
+            sz.Add(msg, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if can_reply:
+            self.reply_text.SetFocus()
         else:
-            self._build_lines()
-            n = len(self._lines)
-            if self.cursor >= n:
-                self.cursor = max(0, n - 1)
-            if self.cursor < self.scroll:
-                self.scroll = self.cursor
-            elif self.cursor >= self.scroll + body_h:
-                self.scroll = self.cursor - body_h + 1
-            for i in range(body_h):
-                idx = self.scroll + i
-                if idx >= n:
-                    break
-                attr = curses.A_REVERSE if idx == self.cursor else curses.A_NORMAL
-                line = self._lines[idx]
-                stdscr.addstr(body_top + i, 0, line[: w - 1], attr)
-                stdscr.clrtoeol()
-            # input line for list views that accept inline input
-            if self.input_active and name in ("posts", "dm_chat", "settings"):
-                self._render_input(stdscr, h - 3, w)
+            self.posts_list.SetFocus()
+        self.announce(f"Posts loaded. {len(posts)} posts.")
 
-        # Status bar
-        status = self.status
-        if self._reconnecting:
-            status = "Reconnecting..."
-        stdscr.addstr(h - 2, 0, " " * (w - 1))
-        stdscr.addstr(h - 2, 0, status[: w - 1], curses.A_BOLD)
-        stdscr.clrtoeol()
+    def on_send_reply(self, event=None):
+        content = self.reply_text.GetValue().strip()
+        if not content:
+            wx.MessageBox("Post content is required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        tid = self.topic_id_stack[-1] if self.topic_id_stack else None
+        if tid:
+            self._send({"type": "create_post", "topic_id": tid, "content": content})
+            self.reply_text.SetValue("")
+            self.announce("Sending reply...")
 
-        # Help line
-        stdscr.addstr(h - 1, 0, self._help_text()[: w - 1], curses.A_DIM)
-        stdscr.clrtoeol()
+    # --- Create Topic Dialog ---
 
-        # Alert overlay
-        if getattr(self, "_alert_msg", None):
-            msg = self._alert_msg
-            box_w = min(w - 4, max(20, len(msg) + 4))
-            box_h = 3
-            by = (h - box_h) // 2
-            bx = (w - box_w) // 2
-            try:
-                win = curses.newwin(box_h, box_w, by, bx)
-                win.border()
-                win.addstr(1, 2, msg[: box_w - 4], curses.A_BOLD)
-                win.refresh()
-            except curses.error:
-                stdscr.addstr(h - 3, 0, msg[: w - 1], curses.A_BOLD)
+    def show_create_topic_dialog(self, event=None):
+        if not self.forum_id_stack:
+            return
+        dlg = wx.Dialog(self, title="Create New Topic", size=(450, 320))
+        sz = wx.BoxSizer(wx.VERTICAL)
 
-        stdscr.refresh()
-        self.dirty = False
+        sz.Add(wx.StaticText(dlg, label="Topic Title:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        title_ctrl = wx.TextCtrl(dlg)
+        sz.Add(title_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
 
-    def _view_title(self):
-        name = self.view["name"] if self.view else ""
-        if name == "server_select":
-            return " Chatwisp — Select Server "
-        if name == "external_server":
-            return " External Server "
-        if name == "login":
-            return f" Chatwisp — Login / Register   (Server: {self._server_uri}) "
-        if name == "forums":
-            who = f"logged in as {self.username}" if self.username else ""
-            adm = " [ADMIN]" if self.is_admin else ""
-            return f" Select Forum   ({who}){adm} "
-        if name == "topics":
-            return " Topics "
-        if name == "posts":
-            t = self.current_topic or {}
-            return f" Posts — {t.get('title', '')} "
-        if name == "accounts":
-            return " User Accounts (Admin) "
-        if name == "user_detail":
-            return f" User: {self.view['user'].get('username', '')} "
-        if name == "dm_list":
-            return " Messages "
-        if name == "dm_search":
-            return " Search Users "
-        if name == "dm_chat":
-            return f" Chat with {self.dm_contact} "
-        if name == "settings":
-            return " Settings "
-        if name == "bot":
-            return " Official Account Controls "
-        if name == "form":
-            return f" {self.view.get('title', 'Form')} "
-        return " Chatwisp "
+        sz.Add(wx.StaticText(dlg, label="First Post (optional):"), 0, wx.LEFT | wx.RIGHT, 15)
+        content_ctrl = wx.TextCtrl(dlg, style=wx.TE_MULTILINE, size=(-1, 120))
+        sz.Add(content_ctrl, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(10)
 
-    def _render_form(self, stdscr, top, w):
-        fields = self.view["fields"]
-        cur = self.view["field"]
-        for i, (label, val, secret) in enumerate(fields):
-            row = top + i * 2
-            stdscr.addstr(row, 0, label[: w - 1])
-            disp = val
-            if secret:
-                disp = "*" * len(val)
-            attr = curses.A_REVERSE if i == cur else curses.A_NORMAL
-            stdscr.addstr(row + 1, 0, "  " + disp[: w - 3], attr)
-            stdscr.clrtoeol()
-        # hint
-        stdscr.addstr(top + len(fields) * 2, 0,
-                      "Tab/Up/Down: switch field · Enter: submit · Esc: cancel"[: w - 1],
-                      curses.A_DIM)
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Create")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
 
-    def _render_input(self, stdscr, row, w):
-        label = self.input_label
-        stdscr.addstr(row, 0, " " * (w - 1))
-        stdscr.addstr(row, 0, f"{label}: {self.input_buf}", curses.A_NORMAL)
-        stdscr.clrtoeol()
-        self._curs(1)
-        try:
-            stdscr.move(row, min(len(label) + 2 + len(self.input_buf), w - 2))
-        except curses.error:
-            pass
+        dlg.SetSizer(sz)
+        title_ctrl.SetFocus()
 
-    def _help_text(self):
-        name = self.view["name"] if self.view else ""
-        if name == "server_select":
-            return "Up/Down: choose · Enter: select"
-        if name in ("login", "external_server", "form"):
-            return "Tab/↑↓: field · Enter: submit · Esc: back"
-        if name == "forums":
-            extra = " · f: new forum · m: messages · s: settings" if self.is_admin else " · m: messages · s: settings"
-            return "↑↓: choose · Enter: open · " + ("a: accounts · " if self.is_admin else "") + "o: official" + extra + " · F1: info · F2: ping · q: quit"
-        if name == "topics":
-            adm = " · c/o: close/open · D: delete · C-n: new topic" if self.is_admin else " · C-n: new topic"
-            return "↑↓: choose · Enter: open · Esc: home" + adm
-        if name == "posts":
-            adm = " · c/o: close/open · a: admin-only · D: del topic · x: del post" if self.is_admin else ""
-            return "↑↓: scroll · r: reply · l: copy link · Esc: back" + adm
-        if name == "accounts":
-            return "↑↓: choose · Enter: actions · Esc: home"
-        if name == "user_detail":
-            return "↑↓: choose · Enter: do action · Esc: back"
-        if name == "dm_list":
-            return "↑↓: choose · Enter: open · n: new message · Esc: home"
-        if name == "dm_search":
-            return "type to search · ↑↓: choose · Enter: open chat · Esc: back"
-        if name == "dm_chat":
-            return "i: type message · Enter: send · Esc: back"
-        if name == "settings":
-            return "i: edit signature · Enter: save · Esc: back"
-        if name == "bot":
-            return "↑↓: choose · Enter: select · Esc: home"
-        return "Esc: back · q: quit"
+        if dlg.ShowModal() == wx.ID_OK:
+            title = title_ctrl.GetValue().strip()
+            content = content_ctrl.GetValue().strip()
+            if title:
+                fid = self.forum_id_stack[-1]
+                self._send({"type": "create_topic", "forum_id": fid, "title": title, "content": content})
+                self.announce("Creating topic...")
+        dlg.Destroy()
 
-    # ------------------------------------------------------------------ #
-    #  Key handling
-    # ------------------------------------------------------------------ #
-    def on_key(self, ch):
-        # Dismiss alert first
-        if getattr(self, "_alert_msg", None):
-            self._alert_msg = None
-            self.dirty = True
-            return
+    # --- Create Forum Dialog (Admin) ---
 
-        name = self.view["name"] if self.view else ""
+    def show_create_forum_dialog(self, event=None):
+        if not self.is_admin:
+            return
+        dlg = wx.Dialog(self, title="Create New Forum", size=(450, 250))
+        sz = wx.BoxSizer(wx.VERTICAL)
 
-        # Global keys
-        if ch == curses.KEY_RESIZE:
-            self.dirty = True
-            return
-        if ch in (ord("q"),) and name in ("server_select", "forums"):
-            self.running = False
-            return
+        sz.Add(wx.StaticText(dlg, label="Forum Name:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        name_ctrl = wx.TextCtrl(dlg)
+        sz.Add(name_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
 
-        # Inline input mode (for posts reply, dm chat, settings)
-        if self.input_active and name in ("posts", "dm_chat", "settings"):
-            self._handle_input_key(ch, name)
-            return
+        sz.Add(wx.StaticText(dlg, label="Description:"), 0, wx.LEFT | wx.RIGHT, 15)
+        desc_ctrl = wx.TextCtrl(dlg)
+        sz.Add(desc_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(15)
 
-        # Form views
-        if name in ("login", "external_server", "form"):
-            self._handle_form_key(ch)
-            return
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Create Forum")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
 
-        # List views
-        if ch in (curses.KEY_UP, ord("k")):
-            if self.cursor > 0:
-                self.cursor -= 1
-            self.dirty = True
-            return
-        if ch in (curses.KEY_DOWN, ord("j")):
-            if self.cursor < max(0, len(self._lines) - 1):
-                self.cursor += 1
-            self.dirty = True
-            return
-        if ch in (27, curses.KEY_BACKSPACE):
-            self._pop_view()
-            return
+        dlg.SetSizer(sz)
+        name_ctrl.SetFocus()
 
-        # Per-view activation
-        self._handle_view_key(name, ch)
+        if dlg.ShowModal() == wx.ID_OK:
+            name = name_ctrl.GetValue().strip()
+            desc = desc_ctrl.GetValue().strip()
+            if name:
+                self._send({"type": "create_forum", "name": name, "description": desc})
+                self.announce("Creating forum...")
+        dlg.Destroy()
 
-    def _handle_input_key(self, ch, name):
-        if ch in (27,):
-            self.input_active = False
-            self.input_buf = ""
-            self._curs(0)
-            self.dirty = True
-            return
-        if ch in (10, 13):
-            self._submit_input(name)
-            return
-        if ch in (curses.KEY_BACKSPACE, 8, 127):
-            if self.input_buf:
-                self.input_buf = self.input_buf[:-1]
-            self.dirty = True
-            return
-        if 32 <= ch <= 126:
-            limit = 50 if name == "settings" else 2000
-            if len(self.input_buf) < limit:
-                self.input_buf += chr(ch)
-            self.dirty = True
-            return
+    # --- Set MOTD Dialog (Admin) ---
 
-    def _submit_input(self, name):
-        text = self.input_buf.strip()
-        if name == "posts":
-            if not text:
-                return
-            tid = self.topic_id_stack[-1] if self.topic_id_stack else None
-            if tid:
-                self._send({"type": "create_post", "topic_id": tid, "content": text})
-                self.input_buf = ""
-                self.input_active = False
-                self._curs(0)
-                self._set_status("Sending reply...")
-        elif name == "dm_chat":
-            if not text or not self.dm_contact:
-                return
-            if self.dm_contact == "Chatwisp Official Account":
-                self._set_status("You cannot reply to the official account")
-                self.input_buf = ""
-                return
-            self._send({"type": "send_dm", "recipient": self.dm_contact, "content": text})
-            self.input_buf = ""
-            self.input_active = False
-            self._curs(0)
-            self._set_status("Sending message...")
-        elif name == "settings":
-            if len(self.input_buf) > 50:
-                self._set_status("Signature must be 50 characters or less")
-                return
-            self._send({"type": "set_signature", "signature": self.input_buf.strip()})
-            self._set_status("Saving signature...")
-    def _handle_form_key(self, ch):
-        fields = self.view["fields"]
-        cur = self.view["field"]
-        if ch in (curses.KEY_UP,):
-            self.view["field"] = (cur - 1) % len(fields)
-            self.dirty = True
+    def show_set_motd_dialog(self, event=None):
+        if not self.is_admin:
             return
-        if ch in (curses.KEY_DOWN, ord("\t"), 9, curses.KEY_TAB):
-            self.view["field"] = (cur + 1) % len(fields)
-            self.dirty = True
-            return
-        if ch in (27,):
-            self._pop_view()
-            return
-        if ch in (10, 13):
-            self._submit_form()
-            return
-        if ch in (curses.KEY_BACKSPACE, 8, 127):
-            label, val, secret = fields[cur]
-            if val:
-                fields[cur] = (label, val[:-1], secret)
-            self.dirty = True
-            return
-        if 32 <= ch <= 126:
-            label, val, secret = fields[cur]
-            if len(val) < 200:
-                fields[cur] = (label, val + chr(ch), secret)
-            self.dirty = True
-            return
+        dlg = wx.Dialog(self, title="Set Message of the Day", size=(450, 200))
+        sz = wx.BoxSizer(wx.VERTICAL)
 
-    def _submit_form(self):
-        name = self.view["name"]
-        fields = self.view["fields"]
-        vals = [f[1].strip() for f in fields]
-        if name == "login":
-            username, password = vals[0], fields[1][1]
-            if not username or not password:
-                self._set_status("Username and password required")
-                return
-            self._saved_uri = self._server_uri
-            self._set_status(f"Connecting to {self._server_uri}...")
-            threading.Thread(target=self._connect,
-                             args=(self._server_uri, username, password, "login"),
-                             daemon=True).start()
-        elif name == "external_server":
-            host, port = vals[0], vals[1]
-            if not host or not port:
-                self._set_status("Server address and port required")
-                return
-            self._server_uri = f"ws://{host}:{port}"
-            self.show_login_view()
-        elif name == "form":
-            self._submit_generic_form(self.view.get("submit", ""), vals, fields)
+        sz.Add(wx.StaticText(dlg, label="Message of the Day:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        motd_ctrl = wx.TextCtrl(dlg)
+        sz.Add(motd_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(15)
 
-    def _submit_generic_form(self, submit, vals, fields):
-        if submit == "register":
-            username, password = vals[0], fields[1][1]
-            if len(username) < 3:
-                self._set_status("Username must be at least 3 characters")
-                return
-            if len(password) < 8:
-                self._set_status("Password must be at least 8 characters")
-                return
-            self._saved_uri = self._server_uri
-            self._set_status(f"Connecting to {self._server_uri}...")
-            threading.Thread(target=self._connect,
-                             args=(self._server_uri, username, password, "register"),
-                             daemon=True).start()
-        elif submit == "create_topic":
-            title, content = vals[0], vals[1]
-            if not title:
-                self._set_status("Title required")
-                return
-            fid = self.forum_id_stack[-1] if self.forum_id_stack else None
-            self._send({"type": "create_topic", "forum_id": fid, "title": title, "content": content})
-            self._pop_view()
-            self._set_status("Creating topic...")
-        elif submit == "create_forum":
-            name_, desc = vals[0], vals[1]
-            if not name_:
-                self._set_status("Forum name required")
-                return
-            self._send({"type": "create_forum", "name": name_, "description": desc})
-            self._pop_view()
-            self._set_status("Creating forum...")
-        elif submit == "set_motd":
-            motd = vals[0]
-            if not motd:
-                self._set_status("MOTD required")
-                return
-            self._send({"type": "set_motd", "motd": motd})
-            self._pop_view()
-            self._set_status("Setting MOTD...")
-        elif submit == "ban":
-            reason = vals[0] or None
-            duration = vals[1] or None
-            user = self.view.get("user")
-            self._send({"type": "ban_user", "username": user.get("username"),
-                        "reason": reason, "duration": duration})
-            self._pop_view()
-            self._set_status("Banning user...")
-        elif submit == "resetpw":
-            p1, p2 = fields[0][1], fields[1][1]
-            if len(p1) < 8:
-                self._set_status("Password must be at least 8 characters")
-                return
-            if p1 != p2:
-                self._set_status("Passwords do not match")
-                return
-            user = self.view.get("user")
-            self._send({"type": "reset_password", "username": user.get("username"), "new_password": p1})
-            self._pop_view()
-            self._set_status("Resetting password...")
-        elif submit == "bot_dm":
-            recipient, content = vals[0], vals[1]
-            if not recipient or not content:
-                self._set_status("Recipient and content required")
-                return
-            self._send({"type": "bot_send_dm", "recipient": recipient, "content": content})
-            self._pop_view()
-            self._set_status("Sending DM as official account...")
-        elif submit == "bot_broadcast":
-            content = vals[0]
-            if not content:
-                self._set_status("Content required")
-                return
-            self._send({"type": "bot_broadcast", "content": content})
-            self._pop_view()
-            self._set_status("Broadcasting...")
-        elif submit == "bot_post":
-            topic_id, content = vals[0], vals[1]
-            if not topic_id or not content:
-                self._set_status("Topic ID and content required")
-                return
-            self._send({"type": "bot_create_post", "topic_id": topic_id, "content": content})
-            self._pop_view()
-            self._set_status("Creating post as official account...")
-        elif submit == "bot_topic":
-            forum_id, title, content = vals[0], vals[1], vals[2]
-            if not forum_id or not title:
-                self._set_status("Forum ID and title required")
-                return
-            self._send({"type": "bot_create_topic", "forum_id": forum_id, "title": title, "content": content})
-            self._pop_view()
-            self._set_status("Creating topic as official account...")
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Set MOTD")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
 
-    def _handle_view_key(self, name, ch):
-        if ch in (10, 13, curses.KEY_RIGHT):
-            self._activate_current(name)
-            return
-        if ch in (ord("f"), ord("F")):
-            if name == "forums" and self.is_admin:
-                self.show_form_view("Create New Forum",
-                                    [("Forum name", "", False), ("Description", "", False)], "create_forum")
-            return
-        if ch == ord("m") and name == "forums":
-            self._send({"type": "get_dm_contacts"})
-            self._set_status("Loading messages...")
-            return
-        if ch == ord("s") and name == "forums":
-            self.show_settings_view()
-            return
-        if ch == ord("a") and name == "forums" and self.is_admin:
-            self._send({"type": "get_users"})
-            self._set_status("Loading accounts...")
-            return
-        if ch == ord("o") and name == "forums" and self.is_admin:
-            self.show_bot_view()
-            return
-        if ch == ord("n") and name == "topics":
-            self.show_form_view("Create New Topic",
-                                [("Topic title", "", False), ("First post (optional)", "", False)], "create_topic")
-            return
-        if ch == ord("n") and name == "dm_list":
-            self._new_message_search()
-            return
-        if ch in (ord("i"), ord("n")) and name == "dm_search":
-            self._new_message_search()
-            return
-        if ch == ord("r") and name == "posts":
-            t = self.current_topic or {}
-            if t.get("closed"):
-                self._set_status("Cannot reply in a closed topic")
-                return
-            if t.get("admin_only") and not self.is_admin:
-                self._set_status("Only admins can post in this topic")
-                return
-            self.input_active = True
-            self.input_label = "Reply"
-            self.input_buf = ""
-            return
-        if ch == ord("i") and name in ("dm_chat", "settings"):
-            if name == "dm_chat" and self.dm_contact == "Chatwisp Official Account":
-                self._set_status("You cannot reply to the official account")
-                return
-            self.input_active = True
-            self.input_label = "Message" if name == "dm_chat" else "Signature"
-            self.input_buf = self.input_buf if self.input_buf else (self.signature if name == "settings" else "")
-            return
-        if ch == ord("l") and name == "posts":
-            self._copy_topic_link()
-            return
-        # Admin topic actions
-        if self.is_admin and name in ("topics", "posts"):
-            if ch == ord("c"):
-                tid = self.topic_id_stack[-1] if self.topic_id_stack else None
-                if tid:
-                    self._send({"type": "close_topic", "topic_id": tid})
-                    self._set_status("Closing topic...")
-            elif ch == ord("o"):
-                tid = self.topic_id_stack[-1] if self.topic_id_stack else None
-                if tid:
-                    self._send({"type": "reopen_topic", "topic_id": tid})
-                    self._set_status("Reopening topic...")
-            elif ch == ord("D"):
-                tid = self.topic_id_stack[-1] if self.topic_id_stack else None
-                if tid and self.stdscr and _confirm(self.stdscr, "Delete this entire topic and all posts? (y/N)"):
-                    self._send({"type": "delete_topic", "topic_id": tid})
-                    self._set_status("Deleting topic...")
-            elif ch == ord("a") and name == "posts":
-                tid = self.topic_id_stack[-1] if self.topic_id_stack else None
-                t = self.current_topic or {}
-                if tid:
-                    if t.get("admin_only"):
-                        self._send({"type": "remove_topic_admin_only", "topic_id": tid})
-                    else:
-                        self._send({"type": "set_topic_admin_only", "topic_id": tid})
-                    self._set_status("Toggling admin only...")
-            elif ch == ord("x") and name == "posts":
-                self._admin_delete_post()
-        if ch == curses.KEY_F1:
-            self._pending_server_info = True
-            self._tts("Retrieving server info")
-            self._send({"type": "server_info"})
-        if ch == curses.KEY_F2:
-            self._pending_ping_time = time.time()
-            self._tts("Pinging...")
-            self._send({"type": "ping", "client_time": self._pending_ping_time})
+        dlg.SetSizer(sz)
+        motd_ctrl.SetFocus()
 
-    def _activate_current(self, name):
-        if not self._line_meta:
-            return
-        idx = self.cursor if 0 <= self.cursor < len(self._line_meta) else 0
-        kind, i = self._line_meta[idx]
-        if name == "server_select":
-            choice = self.view["items"][i][1]
-            if choice == "central":
-                self._server_uri = DEFAULT_URI
-                self.show_login_view()
-            elif choice == "external":
-                self.show_external_server_view()
-            elif choice == "ccauth":
-                self._server_uri = DEFAULT_URI
-                if not websockets_available():
-                    self._show_alert("websockets library not found. Run: pip install websockets")
-                    return
-                self.start_ccauth()
-            elif choice == "quit":
-                self.running = False
-        elif name == "forums":
-            if kind == "forum" and i < len(self.forums):
-                fid = self.forums[i].get("id")
-                self.forum_id_stack.append(fid)
-                self._set_status("Loading topics...")
-                self._send({"type": "get_topics", "forum_id": fid})
-        elif name == "topics":
-            if kind == "topic" and i < len(self.topics):
-                tid = self.topics[i].get("id")
-                self._set_status("Loading posts...")
-                self._send({"type": "get_posts", "topic_id": tid})
-        elif name == "accounts":
-            if kind == "user" and i < len(self.users):
-                self.show_user_detail_view(self.users[i])
-        elif name == "user_detail":
-            if kind == "action":
-                acts = self._user_actions(self.view["user"])
-                action = acts[i][1]
-                self._do_user_action(action, self.view["user"])
-        elif name == "dm_list":
-            if kind == "dm" and i < len(self.dm_contacts):
-                self.dm_contact = self.dm_contacts[i].get("username")
-                self._open_dm_chat()
-        elif name == "dm_search":
-            res = self.view.get("results", [])
-            if kind == "dmuser" and i < len(res):
-                self.dm_contact = res[i]
-                self._open_dm_chat()
-        elif name == "bot":
-            if kind == "bot":
-                choice = self.view["items"][i][1]
-                if choice == "bot_dm":
-                    self.show_form_view("Send DM as Official Account",
-                                        [("Recipient", "", False), ("Message", "", False)], "bot_dm")
-                elif choice == "bot_broadcast":
-                    self.show_form_view("Broadcast to All Users",
-                                        [("Message", "", False)], "bot_broadcast")
-                elif choice == "bot_post":
-                    self.show_form_view("Create Post as Official Account",
-                                        [("Topic ID", "", False), ("Content", "", False)], "bot_post")
-                elif choice == "bot_topic":
-                    self.show_form_view("Create Topic as Official Account",
-                                        [("Forum ID", "", False), ("Title", "", False), ("Content", "", False)],
-                                        "bot_topic")
+        if dlg.ShowModal() == wx.ID_OK:
+            motd = motd_ctrl.GetValue().strip()
+            if motd:
+                self._send({"type": "set_motd", "motd": motd})
+                self.announce("Setting MOTD...")
+        dlg.Destroy()
 
-    def _new_message_search(self):
-        if self.stdscr is None:
-            return
-        q = _prompt(self.stdscr, "Search users:")
-        if q and q.strip():
-            self._send({"type": "search_users", "query": q.strip()})
-            self._set_status("Searching...")
+    # --- Accounts View (Admin) ---
 
-    def _open_dm_chat(self):
-        self.show_dm_chat_view()
-        self._send({"type": "get_dm_conversation", "username": self.dm_contact})
-        self._send({"type": "mark_dms_read", "username": self.dm_contact})
+    def show_users(self, users):
+        self.current_view = "accounts"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
 
-    def _do_dm_search(self):
-        q = self.input_buf.strip()
-        if q:
-            self._send({"type": "search_users", "query": q})
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        home_btn = wx.Button(pnl, label="Home")
+        home_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        nav_sz.Add(home_btn, 0)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
+
+        sz.Add(wx.StaticText(pnl, label="User Accounts:"), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(3)
+
+        self.users_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.users_data = users
+        for u in users:
+            parts = [f"Username: {u['username']}"]
+            if u.get("is_admin"): parts.append("[Admin]")
+            if u.get("banned"):
+                reason = u.get("ban_reason") or "No reason"
+                parts.append(f"[Banned: {reason}]")
+            self.users_list.Append(" ".join(parts))
+        self.users_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_user_select)
+        sz.Add(self.users_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if self.users_list.GetCount() > 0:
+            self.users_list.SetFocus()
+            self.users_list.SetSelection(0)
+        self.announce(f"Users loaded. {len(users)} users.")
+
+    def _do_user_select(self):
+        idx = self.users_list.GetSelection()
+        if idx >= 0 and idx < len(self.users_data):
+            self.show_user_detail_dialog(self.users_data[idx])
+
+    def on_user_select(self, event):
+        self._do_user_select()
+
+    def show_user_detail_dialog(self, user):
+        dlg = wx.Dialog(self, title=f"User: {user['username']}", size=(400, 340))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        info = f"Username: {user['username']}\nAdmin: {'Yes' if user.get('is_admin') else 'No'}\nBanned: {'Yes' if user.get('banned') else 'No'}"
+        if user.get("ban_reason"):
+            info += f"\nBan Reason: {user['ban_reason']}"
+        sz.Add(wx.StaticText(dlg, label=info), 0, wx.ALL, 15)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+
+        if not user.get("banned"):
+            ban_btn = wx.Button(dlg, label="Ban User")
+            ban_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_ban_flow(dlg, user))
+            btn_sz.Add(ban_btn, 0, wx.RIGHT, 5)
         else:
-            self._search_results = []
-            self.view["results"] = []
-            self.dirty = True
+            unban_btn = wx.Button(dlg, label="Unban User")
+            unban_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "unban_user", user["username"]))
+            btn_sz.Add(unban_btn, 0, wx.RIGHT, 5)
 
-    def _do_user_action(self, action, user):
-        uname = user.get("username")
-        if action == "back":
-            self._pop_view()
+        if user["username"] != self.username:
+            delete_btn = wx.Button(dlg, label="Delete User")
+            delete_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_delete_user(dlg, user))
+            btn_sz.Add(delete_btn, 0, wx.RIGHT, 5)
+
+        if self.is_super_admin and not user.get("super_admin") and user["username"] != self.username:
+            if not user.get("is_admin"):
+                promote_btn = wx.Button(dlg, label="Promote to Admin")
+                promote_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "promote_admin", user["username"]))
+                btn_sz.Add(promote_btn, 0, wx.RIGHT, 5)
+            elif user.get("is_admin") and not user.get("super_admin"):
+                demote_btn = wx.Button(dlg, label="Demote from Admin")
+                demote_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_simple_action(dlg, "demote_admin", user["username"]))
+                btn_sz.Add(demote_btn, 0, wx.RIGHT, 5)
+
+        if self.is_admin and user["username"] != self.username:
+            reset_pw_btn = wx.Button(dlg, label="Reset Password")
+            reset_pw_btn.Bind(wx.EVT_BUTTON, lambda e: self._do_reset_password(dlg, user))
+            btn_sz.Add(reset_pw_btn, 0, wx.RIGHT, 5)
+
+        close_btn = wx.Button(dlg, wx.ID_CLOSE, label="Close")
+        btn_sz.Add(close_btn, 0)
+
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+        dlg.SetSizer(sz)
+        dlg.ShowModal()
+        dlg.Destroy()
+
+    def _do_simple_action(self, dlg, action, username):
+        self._send({"type": action, "username": username})
+        dlg.EndModal(wx.ID_CLOSE)
+        labels = {"ban_user": "Banning", "unban_user": "Unbanning", "promote_admin": "Promoting", "demote_admin": "Demoting", "delete_user": "Deleting"}
+        self.announce(f"{labels.get(action, 'Processing')} {username}...")
+
+    def _do_ban_flow(self, parent_dlg, user):
+        parent_dlg.EndModal(wx.ID_CLOSE)
+        dlg = wx.Dialog(self, title=f"Ban {user['username']}", size=(400, 250))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        sz.Add(wx.StaticText(dlg, label="Ban Reason (optional):"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        reason_ctrl = wx.TextCtrl(dlg)
+        sz.Add(reason_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
+
+        sz.Add(wx.StaticText(dlg, label="Duration (optional, leave blank for infinite):"), 0, wx.LEFT | wx.RIGHT, 15)
+        duration_ctrl = wx.TextCtrl(dlg)
+        sz.Add(duration_ctrl, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(15)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Ban")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+
+        dlg.SetSizer(sz)
+        reason_ctrl.SetFocus()
+
+        if dlg.ShowModal() == wx.ID_OK:
+            reason = reason_ctrl.GetValue().strip() or None
+            duration = duration_ctrl.GetValue().strip() or None
+            self._send({"type": "ban_user", "username": user["username"], "reason": reason, "duration": duration})
+            self.announce(f"Banning {user['username']}...")
+        dlg.Destroy()
+
+    def _do_delete_user(self, parent_dlg, user):
+        result = wx.MessageBox(
+            f"Are you sure you want to delete user '{user['username']}'?\n\nThis action cannot be undone.",
+            "Confirm Delete",
+            wx.YES_NO | wx.ICON_QUESTION,
+        )
+        if result == wx.YES:
+            self._send({"type": "delete_user", "username": user["username"]})
+            parent_dlg.EndModal(wx.ID_CLOSE)
+            self.announce(f"Deleting {user['username']}...")
+
+    def _do_reset_password(self, parent_dlg, user):
+        dlg = wx.Dialog(self, title=f"Reset Password for {user['username']}", size=(400, 250))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        sz.Add(wx.StaticText(dlg, label="New Password:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        new_pw = wx.TextCtrl(dlg, style=wx.TE_PASSWORD)
+        sz.Add(new_pw, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
+
+        sz.Add(wx.StaticText(dlg, label="Confirm Password:"), 0, wx.LEFT | wx.RIGHT, 15)
+        confirm_pw = wx.TextCtrl(dlg, style=wx.TE_PASSWORD)
+        sz.Add(confirm_pw, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(15)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        ok_btn = wx.Button(dlg, wx.ID_OK, label="Reset Password")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(ok_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+
+        dlg.SetSizer(sz)
+        new_pw.SetFocus()
+
+        if dlg.ShowModal() == wx.ID_OK:
+            p1 = new_pw.GetValue()
+            p2 = confirm_pw.GetValue()
+            if not p1 or len(p1) < 8:
+                wx.MessageBox("Password must be at least 8 characters", "Error", wx.OK | wx.ICON_ERROR)
+            elif p1 != p2:
+                wx.MessageBox("Passwords do not match", "Error", wx.OK | wx.ICON_ERROR)
+            else:
+                self._send({"type": "reset_password", "username": user["username"], "new_password": p1})
+                parent_dlg.EndModal(wx.ID_CLOSE)
+                self.announce(f"Resetting password for {user['username']}...")
+        dlg.Destroy()
+
+    # --- Admin Topic Actions ---
+
+    def _admin_close_topic(self):
+        if not self.is_admin:
+            self.announce("Admin access required")
             return
-        if action == "unban":
-            self._send({"type": "unban_user", "username": uname})
-            self._pop_view()
-            self._set_status("Unbanning user...")
-        elif action == "delete":
-            if self.stdscr and _confirm(self.stdscr, f"Delete user '{uname}'? This cannot be undone. (y/N)"):
-                self._send({"type": "delete_user", "username": uname})
-                self._pop_view()
-                self._set_status("Deleting user...")
-        elif action == "promote":
-            self._send({"type": "promote_admin", "username": uname})
-            self._pop_view()
-            self._set_status("Promoting user...")
-        elif action == "demote":
-            self._send({"type": "demote_admin", "username": uname})
-            self._pop_view()
-            self._set_status("Demoting user...")
-        elif action == "ban":
-            self.show_form_view(f"Ban {uname}",
-                                [("Reason (optional)", "", False), ("Duration (optional, blank=infinite)", "", False)],
-                                "ban")
-        elif action == "resetpw":
-            self.show_form_view(f"Reset password for {uname}",
-                                [("New password", "", True), ("Confirm password", "", True)], "resetpw")
+        tid = self.topic_id_stack[-1] if self.topic_id_stack else None
+        if tid:
+            self._send({"type": "close_topic", "topic_id": tid})
+            self.announce("Closing topic...")
+
+    def _admin_reopen_topic(self):
+        if not self.is_admin:
+            self.announce("Admin access required")
+            return
+        tid = self.topic_id_stack[-1] if self.topic_id_stack else None
+        if tid:
+            self._send({"type": "reopen_topic", "topic_id": tid})
+            self.announce("Reopening topic...")
 
     def _admin_delete_post(self):
-        # find the post the cursor currently sits on
-        if not self._line_meta:
+        if not self.is_admin:
+            self.announce("Admin access required")
             return
-        idx = self.cursor if 0 <= self.cursor < len(self._line_meta) else 0
-        kind, pidx = self._line_meta[idx]
-        if kind != "post" or pidx is None or pidx >= len(self.posts):
-            self._set_status("Select a post first")
+        idx = self.posts_list.GetSelection()
+        if idx < 0 or idx >= len(self.posts_data):
+            self.announce("Select a post first")
             return
-        post = self.posts[pidx]
-        if self.stdscr and _confirm(self.stdscr, f"Delete post by {post.get('author')}? (y/N)"):
-            self._send({"type": "delete_post", "post_id": post.get("id")})
-            self._set_status("Deleting post...")
+        post = self.posts_data[idx]
+        if wx.MessageBox(f"Delete this post by {post['author']}? This cannot be undone.", "Confirm Delete", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+            self._send({"type": "delete_post", "post_id": post["id"]})
+            self.announce("Deleting post...")
 
-    def _copy_topic_link(self):
-        t = self.current_topic or {}
-        forum_id = t.get("forum_id", "")
-        slug = t.get("slug", "")
-        if not forum_id or not slug:
-            self._set_status("Topic link not available")
+    def _admin_delete_topic(self):
+        if not self.is_admin:
+            self.announce("Admin access required")
             return
-        link = f"https://chatwisp.onrender.com/forums/{forum_id}/{slug}"
-        try:
-            # xclip / xsel if available
-            for tool in ("xclip", "xsel"):
-                if shutil.which(tool):
-                    subprocess.Popen([tool], stdin=subprocess.PIPE,
-                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).stdin.write(
-                        link.encode())
-                    self._set_status("Topic link copied to clipboard")
-                    return
-            self._set_status(f"Link: {link}")
-        except Exception:
-            self._set_status(f"Link: {link}")
+        tid = self.topic_id_stack[-1] if self.topic_id_stack else None
+        if tid:
+            if wx.MessageBox("Delete this entire topic and all its posts? This cannot be undone.", "Confirm Delete", wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
+                self._send({"type": "delete_topic", "topic_id": tid})
+                self.announce("Deleting topic...")
 
-    def _handle_ccauth_new_user(self, data):
-        email = data.get("email", "")
-        if self.stdscr is None:
+    def _admin_toggle_admin_only(self):
+        if not self.is_admin or not self.topic_id_stack:
             return
-        uname = _prompt(self.stdscr,
-                        f"New account — choose a username (email: {email[:24]}):")
-        if uname and len(uname) >= 3:
-            threading.Thread(target=self._ccauth_register, args=(uname,), daemon=True).start()
+        tid = self.topic_id_stack[-1]
+        if self.current_topic_data and self.current_topic_data.get("admin_only"):
+            self._send({"type": "remove_topic_admin_only", "topic_id": tid})
+            self.announce("Removing admin only...")
         else:
-            self._set_status("Username must be at least 3 characters")
+            self._send({"type": "set_topic_admin_only", "topic_id": tid})
+            self.announce("Setting admin only...")
 
-    # ------------------------------------------------------------------ #
-    #  Main loop
-    # ------------------------------------------------------------------ #
-    def run(self, stdscr):
-        self.stdscr = stdscr
-        stdscr.keypad(True)
-        curses.noecho()
-        self._curs(0)
-        stdscr.timeout(100)
-        self.show_server_select()
-        while self.running:
-            self._drain_recv()
-            self._maybe_keepalive()
-            if self.dirty:
-                self.render()
-            ch = stdscr.getch()
-            if ch != -1:
-                self.on_key(ch)
-        try:
-            if self.ws:
+    def show_bot_controls(self):
+        self.current_view = "bot_controls"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Official Account Controls")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 3); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.ALL, 15)
+
+        # Send DM
+        sz.Add(wx.StaticText(pnl, label="Send DM as Official Account:"), 0, wx.LEFT | wx.RIGHT, 10)
+        gs = wx.FlexGridSizer(2, 2, 5, 10)
+        gs.Add(wx.StaticText(pnl, label="Recipient:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_dm_recipient = wx.TextCtrl(pnl)
+        gs.Add(self.bot_dm_recipient, 0, wx.EXPAND)
+        gs.Add(wx.StaticText(pnl, label="Message:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_dm_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        gs.Add(self.bot_dm_content, 0, wx.EXPAND)
+        gs.AddGrowableCol(1)
+        sz.Add(gs, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        send_dm_btn = wx.Button(pnl, label="Send DM")
+        send_dm_btn.Bind(wx.EVT_BUTTON, self._on_bot_send_dm)
+        sz.Add(send_dm_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        # Broadcast
+        sz.Add(wx.StaticText(pnl, label="Broadcast to All Users:"), 0, wx.LEFT | wx.RIGHT, 10)
+        self.bot_broadcast_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        sz.Add(self.bot_broadcast_content, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        broadcast_btn = wx.Button(pnl, label="Broadcast")
+        broadcast_btn.Bind(wx.EVT_BUTTON, self._on_bot_broadcast)
+        sz.Add(broadcast_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        # Create Post
+        sz.Add(wx.StaticText(pnl, label="Create Post as Official Account:"), 0, wx.LEFT | wx.RIGHT, 10)
+        gs2 = wx.FlexGridSizer(2, 2, 5, 10)
+        gs2.Add(wx.StaticText(pnl, label="Topic ID:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_post_topic = wx.TextCtrl(pnl)
+        gs2.Add(self.bot_post_topic, 0, wx.EXPAND)
+        gs2.Add(wx.StaticText(pnl, label="Content:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_post_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        gs2.Add(self.bot_post_content, 0, wx.EXPAND)
+        gs2.AddGrowableCol(1)
+        sz.Add(gs2, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        create_post_btn = wx.Button(pnl, label="Create Post")
+        create_post_btn.Bind(wx.EVT_BUTTON, self._on_bot_create_post)
+        sz.Add(create_post_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        # Create Topic
+        sz.Add(wx.StaticText(pnl, label="Create Topic as Official Account:"), 0, wx.LEFT | wx.RIGHT, 10)
+        gs3 = wx.FlexGridSizer(3, 2, 5, 10)
+        gs3.Add(wx.StaticText(pnl, label="Forum ID:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_topic_forum = wx.TextCtrl(pnl)
+        gs3.Add(self.bot_topic_forum, 0, wx.EXPAND)
+        gs3.Add(wx.StaticText(pnl, label="Title:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_topic_title = wx.TextCtrl(pnl)
+        gs3.Add(self.bot_topic_title, 0, wx.EXPAND)
+        gs3.Add(wx.StaticText(pnl, label="Content:"), 0, wx.ALIGN_CENTER_VERTICAL)
+        self.bot_topic_content = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        gs3.Add(self.bot_topic_content, 0, wx.EXPAND)
+        gs3.AddGrowableCol(1)
+        sz.Add(gs3, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        create_topic_btn = wx.Button(pnl, label="Create Topic")
+        create_topic_btn.Bind(wx.EVT_BUTTON, self._on_bot_create_topic)
+        sz.Add(create_topic_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddSpacer(10)
+        back_btn = wx.Button(pnl, label="Back to Main Menu")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        sz.Add(back_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.bot_dm_recipient.SetFocus()
+        self.announce("Official account controls")
+
+    def _on_bot_send_dm(self, event):
+        recipient = self.bot_dm_recipient.GetValue().strip()
+        content = self.bot_dm_content.GetValue().strip()
+        if not recipient or not content:
+            wx.MessageBox("Recipient and content required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "bot_send_dm", "recipient": recipient, "content": content})
+        self.announce("Sending DM as official account...")
+
+    def _on_bot_broadcast(self, event):
+        content = self.bot_broadcast_content.GetValue().strip()
+        if not content:
+            wx.MessageBox("Content required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        result = wx.MessageBox("Broadcast this message to ALL users? This cannot be undone.", "Confirm Broadcast", wx.YES_NO | wx.ICON_QUESTION)
+        if result == wx.YES:
+            self._send({"type": "bot_broadcast", "content": content})
+            self.announce("Broadcasting...")
+
+    def _on_bot_create_post(self, event):
+        topic_id = self.bot_post_topic.GetValue().strip()
+        content = self.bot_post_content.GetValue().strip()
+        if not topic_id or not content:
+            wx.MessageBox("Topic ID and content required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "bot_create_post", "topic_id": topic_id, "content": content})
+        self.announce("Creating post as official account...")
+
+    def _on_bot_create_topic(self, event):
+        forum_id = self.bot_topic_forum.GetValue().strip()
+        title = self.bot_topic_title.GetValue().strip()
+        content = self.bot_topic_content.GetValue().strip()
+        if not forum_id or not title:
+            wx.MessageBox("Forum ID and title required", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "bot_create_topic", "forum_id": forum_id, "title": title, "content": content})
+        self.announce("Creating topic as official account...")
+
+    def _copy_topic_link(self, topic):
+        forum_id = topic.get("forum_id", "")
+        slug = topic.get("slug", "")
+        if not forum_id or not slug:
+            wx.MessageBox("Topic link not available", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        web_url = f"https://chatwisp.onrender.com/forums/{forum_id}/{slug}"
+        if wx.TheClipboard.Open():
+            wx.TheClipboard.SetData(wx.TextDataObject(web_url))
+            wx.TheClipboard.Close()
+            self.announce("Topic link copied to clipboard")
+        else:
+            wx.MessageBox("Could not copy to clipboard", "Error", wx.OK | wx.ICON_ERROR)
+
+    def show_settings(self):
+        self.current_view = "settings"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        title = wx.StaticText(pnl, label="Settings")
+        f = title.GetFont(); f.SetPointSize(f.GetPointSize() + 3); f = f.Bold()
+        title.SetFont(f)
+        sz.Add(title, 0, wx.ALL, 15)
+
+        sz.Add(wx.StaticText(pnl, label="Forum Signature:"), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.Add(wx.StaticText(pnl, label="This text will appear at the end of every post you make. Max 50 characters."), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(5)
+        self.sig_text = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+        self.sig_text.SetMaxLength(50)
+        sz.Add(self.sig_text, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+        self.sig_counter = wx.StaticText(pnl, label="0/50")
+        sz.Add(self.sig_counter, 0, wx.LEFT | wx.RIGHT | wx.TOP, 5)
+        self.sig_text.Bind(wx.EVT_TEXT, self._on_sig_text)
+        sz.AddSpacer(10)
+        save_btn = wx.Button(pnl, label="Save Signature")
+        save_btn.Bind(wx.EVT_BUTTON, self._on_save_signature)
+        sz.Add(save_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        sz.AddStretchSpacer()
+        back_btn = wx.Button(pnl, label="Back to Main Menu")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        sz.Add(back_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 15)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        self.sig_text.SetFocus()
+
+        self._send({"type": "get_signature"})
+        self.announce("Settings")
+
+    def _on_sig_text(self, event):
+        length = len(self.sig_text.GetValue())
+        self.sig_counter.SetLabel(f"{length}/50")
+
+    def _on_save_signature(self, event):
+        sig = self.sig_text.GetValue().strip()
+        if len(sig) > 50:
+            wx.MessageBox("Signature must be 50 characters or less", "Error", wx.OK | wx.ICON_ERROR)
+            return
+        self._send({"type": "set_signature", "signature": sig})
+        self.announce("Saving signature...")
+
+    # --- Private Messages ---
+
+    def show_dm_contacts(self, contacts):
+        self.current_view = "dm_list"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        home_btn = wx.Button(pnl, label="Home")
+        home_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_main_menu())
+        nav_sz.Add(home_btn, 0, wx.RIGHT, 5)
+        new_msg_btn = wx.Button(pnl, label="New Message")
+        new_msg_btn.Bind(wx.EVT_BUTTON, lambda e: self.show_dm_search_dialog())
+        nav_sz.Add(new_msg_btn, 0)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
+
+        sz.Add(wx.StaticText(pnl, label="Conversations:"), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(3)
+
+        self.dm_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.dm_contacts_data = contacts
+        for c in contacts:
+            self.dm_list.Append(f"{c['username']}: {c['last_message']}")
+        self.dm_list.Bind(wx.EVT_LISTBOX_DCLICK, self.on_dm_contact_select)
+        sz.Add(self.dm_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if self.dm_list.GetCount() > 0:
+            self.dm_list.SetFocus()
+            self.dm_list.SetSelection(0)
+        self.announce(f"{len(contacts)} conversations.")
+
+    def on_dm_contact_select(self, event):
+        idx = self.dm_list.GetSelection()
+        if idx >= 0 and idx < len(self.dm_contacts_data):
+            self.dm_contact = self.dm_contacts_data[idx]["username"]
+            self.show_dm_chat()
+
+    def show_dm_search_dialog(self):
+        dlg = wx.Dialog(self, title="Search Users", size=(400, 400))
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        sz.Add(wx.StaticText(dlg, label="Search for a user:"), 0, wx.TOP | wx.LEFT | wx.RIGHT, 15)
+        search_input = wx.TextCtrl(dlg)
+        sz.Add(search_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(8)
+
+        results_list = wx.ListBox(dlg, style=wx.LB_SINGLE, size=(-1, 200))
+        sz.Add(results_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 15)
+        sz.AddSpacer(10)
+
+        btn_sz = wx.BoxSizer(wx.HORIZONTAL)
+        open_btn = wx.Button(dlg, label="Open Chat")
+        cancel_btn = wx.Button(dlg, wx.ID_CANCEL, label="Cancel")
+        btn_sz.Add(open_btn, 0, wx.RIGHT, 8)
+        btn_sz.Add(cancel_btn, 0)
+        sz.Add(btn_sz, 0, wx.ALIGN_CENTER | wx.BOTTOM, 15)
+
+        dlg.SetSizer(sz)
+        search_input.SetFocus()
+
+        def on_search(event=None):
+            q = search_input.GetValue().strip()
+            if q:
+                self._send({"type": "search_users", "query": q})
+                self.announce("Searching...")
+
+        search_input.Bind(wx.EVT_TEXT, on_search)
+
+        # Temporary handler for search results
+        original_recv = self.recv_queue.get
+
+        def on_open(event):
+            idx = results_list.GetSelection()
+            if idx >= 0:
+                username_str = results_list.GetString(idx).split(" (")[0]
+                self.dm_contact = username_str
+                dlg.EndModal(wx.ID_OK)
+
+        open_btn.Bind(wx.EVT_BUTTON, on_open)
+        results_list.Bind(wx.EVT_LISTBOX_DCLICK, on_open)
+
+        # Store results callback
+        self._dm_search_list = results_list
+
+        if dlg.ShowModal() == wx.ID_OK and self.dm_contact:
+            self.show_dm_chat()
+        dlg.Destroy()
+
+    def show_dm_search_results(self, users):
+        if hasattr(self, '_dm_search_list') and self._dm_search_list:
+            self._dm_search_list.Clear()
+            for u in users:
+                self._dm_search_list.Append(u)
+
+    def show_dm_chat(self):
+        if not self.dm_contact:
+            return
+        self.current_view = "dm_chat"
+        pnl = wx.Panel(self.main_panel)
+        sz = wx.BoxSizer(wx.VERTICAL)
+
+        nav_sz = wx.BoxSizer(wx.HORIZONTAL)
+        back_btn = wx.Button(pnl, label="Back to Messages")
+        back_btn.Bind(wx.EVT_BUTTON, lambda e: self._send({"type": "get_dm_contacts"}))
+        nav_sz.Add(back_btn, 0)
+        sz.Add(nav_sz, 0, wx.ALL, 10)
+
+        title_text = f"Chat with {self.dm_contact}"
+        sz.Add(wx.StaticText(pnl, label=title_text), 0, wx.LEFT | wx.RIGHT, 10)
+        sz.AddSpacer(5)
+
+        self.dm_message_list = wx.ListBox(pnl, style=wx.LB_SINGLE)
+        self.dm_messages_data = []
+        sz.Add(self.dm_message_list, 1, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+
+        sz.AddSpacer(5)
+        if self.dm_contact == "Chatwisp Official Account":
+            bot_label = wx.StaticText(pnl, label="This is the Chatwisp Official Account. You cannot reply to it.")
+            f = bot_label.GetFont(); f = f.Italic()
+            bot_label.SetFont(f)
+            sz.Add(bot_label, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM, 10)
+        else:
+            dm_input_label = wx.StaticText(pnl, label="Type a message:")
+            sz.Add(dm_input_label, 0, wx.LEFT | wx.RIGHT | wx.TOP, 10)
+            self.dm_input = wx.TextCtrl(pnl, style=wx.TE_MULTILINE, size=(-1, 60))
+            sz.Add(self.dm_input, 0, wx.EXPAND | wx.LEFT | wx.RIGHT, 10)
+            send_dm_btn = wx.Button(pnl, label="Send")
+            send_dm_btn.Bind(wx.EVT_BUTTON, self.on_send_dm)
+            sz.Add(send_dm_btn, 0, wx.LEFT | wx.RIGHT | wx.BOTTOM | wx.TOP, 10)
+
+        pnl.SetSizer(sz)
+        self.switch_view(pnl)
+        if hasattr(self, 'dm_input') and self.dm_input:
+            self.dm_input.SetFocus()
+
+        self._send({"type": "get_dm_conversation", "username": self.dm_contact})
+        self._send({"type": "mark_dms_read", "username": self.dm_contact})
+        self.announce(f"Chat with {self.dm_contact}")
+
+    def show_dm_conversation(self, messages):
+        if not hasattr(self, 'dm_message_list'):
+            return
+        self.dm_messages_data = messages
+        self.dm_message_list.Clear()
+        for m in messages:
+            label = "You" if m["sender"] == self.username else m["sender"]
+            self.dm_message_list.Append(f"{label}: {m['content']}")
+        if messages:
+            self.dm_message_list.SetSelection(len(messages) - 1)
+        self.announce(f"{len(messages)} messages.")
+
+    def on_send_dm(self, event=None):
+        content = self.dm_input.GetValue().strip()
+        if not content or not self.dm_contact:
+            return
+        self._send({"type": "send_dm", "recipient": self.dm_contact, "content": content})
+        self.dm_input.SetValue("")
+        self.announce("Sending message...")
+
+    # --- Navigation ---
+
+    def _go_back_to_topics(self):
+        if self.forum_id_stack:
+            fid = self.forum_id_stack[-1]
+            if self.topic_id_stack:
+                self.topic_id_stack.pop()
+            self._request_topics(fid)
+
+    def _go_back_to_forums(self):
+        if self.forum_id_stack:
+            self.forum_id_stack.pop()
+        self._request_forums()
+
+    def on_char_hook(self, event):
+        key = event.GetKeyCode()
+        if key in (wx.WXK_RETURN, wx.WXK_SPACE):
+            focused = wx.Window.FindFocus()
+            if focused == getattr(self, 'forum_list', None) and hasattr(self, 'forum_list'):
+                self._do_forum_select()
+                return
+            if focused == getattr(self, 'topic_list', None) and hasattr(self, 'topic_list'):
+                self._do_topic_select()
+                return
+            if focused == getattr(self, 'users_list', None) and hasattr(self, 'users_list'):
+                self._do_user_select()
+                return
+            if focused == getattr(self, 'dm_list', None) and hasattr(self, 'dm_list'):
+                self.on_dm_contact_select(None)
+                return
+            event.Skip()
+            return
+        elif key == wx.WXK_ESCAPE:
+            if self.current_view == "login":
+                self.Close()
+            elif self.current_view == "forums":
+                self.Close()
+            elif self.current_view == "topics":
+                self.show_main_menu()
+            elif self.current_view == "posts":
+                self._go_back_to_topics()
+            elif self.current_view == "accounts":
+                self.show_main_menu()
+            else:
+                self.show_main_menu()
+            return
+        elif key == wx.WXK_F1:
+            self._tts_speak("Retrieving server info")
+            self._pending_server_info = True
+            self._send({"type": "server_info"})
+            return
+        elif key == wx.WXK_F2:
+            self._tts_speak("Pinging...")
+            self._pending_ping_time = time.time()
+            self._send({"type": "ping", "client_time": self._pending_ping_time})
+            return
+        event.Skip()
+
+    def on_ctrl_n(self, event):
+        if self.current_view == "forums" and self.is_admin:
+            self.show_create_forum_dialog()
+        elif self.current_view == "topics":
+            self.show_create_topic_dialog()
+
+    def on_ctrl_k(self, event):
+        if self.is_admin and self.current_view in ("posts", "topics"):
+            self._admin_close_topic()
+
+    def on_ctrl_o(self, event):
+        if self.is_admin and self.current_view in ("posts", "topics"):
+            self._admin_reopen_topic()
+
+    def on_close(self, event):
+        self.running = False
+        if self.ws:
+            try:
                 self.ws.close()
-        except Exception:
-            pass
+            except Exception:
+                pass
+        self.Destroy()
 
 
-def main(stdscr):
-    if not websockets_available():
-        stdscr.addstr(0, 0, "websockets library not found. Run: pip install websockets")
-        stdscr.addstr(1, 0, "Press any key to exit.")
-        stdscr.getch()
+class ChatwispApp(wx.App):
+    def OnInit(self):
+        self.frame = ChatwispFrame()
+        self.frame.Show()
+        return True
+
+
+def main():
+    if not HAS_WEBSOCKETS:
+        wx.MessageBox(
+            "websockets library not found.\nRun: pip install websockets",
+            "Error",
+            wx.OK | wx.ICON_ERROR,
+        )
         return
     app = ChatwispApp()
-    try:
-        app.run(stdscr)
-    finally:
-        curses.endwin()
+    app.MainLoop()
 
 
 if __name__ == "__main__":
-    try:
-        curses.wrapper(main)
-    except KeyboardInterrupt:
-        pass
-    except curses.error as exc:
-        sys.stderr.write(
-            "Chatwisp could not initialize the terminal interface.\n"
-            "Please run this program inside a real terminal (not piped or redirected).\n"
-            f"curses error: {exc}\n"
-        )
-        sys.exit(1)
-    except Exception as exc:
-        sys.stderr.write(f"Chatwisp encountered an error: {exc}\n")
-        sys.exit(1)
+    main()

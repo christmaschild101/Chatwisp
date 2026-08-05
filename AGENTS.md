@@ -5,7 +5,8 @@
 ```
 server.py              # WebSocket server (Python, websockets lib + asyncpg, bcrypt)
 client_windows.py      # Windows desktop client (wxPython)
-client_linux.py        # Linux terminal client (curses TUI; same WebSocket protocol)
+client_linux.py        # Linux desktop GUI client (wxPython; layout-identical to client_windows.py)
+client_linux_curses.py # Linux terminal client (curses TUI; SSH/headless; same WebSocket protocol)
 client_web/            # Static HTML+CSS+JS web client (no build step)
 client_web/music/      # MP3s served by server at /music/ (gitignored)
 server_data/           # Local seed data (gitignored; server falls back to DEFAULT_FORUMS)
@@ -66,7 +67,8 @@ Both default to `wss://chatwisp.onrender.com`.
 
 - **Web client**: navigate to `https://chatwisp.onrender.com/` in any browser (server serves the static files from `client_web/`).
 - **Windows client**: `pip install wxPython && python client_windows.py`.
-- **Linux client**: `pip install websockets && python3 client_linux.py` (curses TUI; runs in any terminal, including over SSH). Uses `spd-say`/`espeak`/`espeak-ng` for spoken status announcements when available (accessibility parity with the Windows NVDA/SAPI support).
+- **Linux GUI client**: `pip install wxPython websockets && python3 client_linux.py` — a wxPython GUI layout- and feature-identical to the Windows client (the source is `client_windows.py` with only the TTS backend swapped to `spd-say`/`espeak`/`espeak-ng`).
+- **Linux terminal client**: `pip install websockets && python3 client_linux_curses.py` (curses TUI; runs in any terminal, including over SSH). Uses `spd-say`/`espeak`/`espeak-ng` for spoken status announcements when available (accessibility parity with the Windows NVDA/SAPI support).
 
 ## Building the Windows Executable
 
@@ -82,19 +84,35 @@ cp dist/Chatwisp.exe site/Chatwisp.exe
 
 ## Building / Running the Linux client
 
-The Linux client is a pure-Python curses TUI with no build step and a single
-third-party dependency (`websockets`). The networking/protocol layer is split
-from the curses UI so it can be exercised headless for testing:
+### GUI client (`client_linux.py`)
+
+A wxPython desktop GUI, layout- and feature-identical to `client_windows.py`
+(the source is `client_windows.py` with only the TTS backend swapped to
+`spd-say`/`espeak`/`espeak-ng`). Requires a graphical session:
+
+```bash
+pip install wxPython websockets
+python3 client_linux.py
+```
+
+Keep it in sync with `client_windows.py`: when the Windows client changes,
+mirror the change here (only the TTS method and the imports differ).
+
+### Terminal client (`client_linux_curses.py`)
+
+A pure-Python curses TUI with no build step and a single third-party
+dependency (`websockets`). The networking/protocol layer is split from the
+curses UI so it can be exercised headless for testing:
 
 ```bash
 pip install websockets
-python3 client_linux.py          # run in a real terminal
+python3 client_linux_curses.py    # run in a real terminal
 ```
 
-Protocol compatibility: `client_linux.py` sends `client_version` matching
-`MINIMUM_CLIENT_VERSION` and implements every server message type used by
-`client_windows.py` (forums, topics, posts, DMs, admin/bot actions, signature,
-ping/server_info, christmaschild OAuth login).
+Protocol compatibility: `client_linux_curses.py` sends `client_version`
+matching `MINIMUM_CLIENT_VERSION` and implements every server message type
+used by `client_windows.py` (forums, topics, posts, DMs, admin/bot actions,
+signature, ping/server_info, christmaschild OAuth login).
 
 ## Music
 

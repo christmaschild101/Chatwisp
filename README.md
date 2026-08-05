@@ -36,7 +36,8 @@ Only the first such message succeeds (no prior admin exists).
 
 - **Web client**: open `http://your-server:8765/` in any browser (server serves `client_web/`).
 - **Windows client**: `pip install wxPython && python client_windows.py`.
-- **Linux client**: `pip install websockets && python3 client_linux.py` (terminal / curses TUI).
+- **Linux client (GUI)**: `pip install wxPython websockets && python3 client_linux.py` — a desktop GUI identical in layout and features to the Windows client.
+- **Linux client (terminal)**: `pip install websockets && python3 client_linux_curses.py` — curses TUI for SSH/headless use.
 
 All clients default to `wss://chatwisp.onrender.com` — override the URL on the login screen to point to your server.
 
@@ -92,19 +93,31 @@ The server serves 5 royalty-free MP3s from the `/music/` endpoint. Music was rem
 
 ## Linux client
 
-A native terminal client (`client_linux.py`) is provided for Linux users. It is
-a curses-based TUI that speaks the same WebSocket protocol as the Windows client,
-so Linux, Windows and web users all share the same forums, topics, posts and
-direct messages.
+Two Linux clients are provided; both speak the same WebSocket protocol as the
+Windows client, so Linux, Windows and web users all share the same forums,
+topics, posts and direct messages.
+
+### GUI client (`client_linux.py`)
+
+A wxPython desktop GUI, layout- and feature-identical to the Windows client.
+Requires a graphical session (not suitable over plain SSH).
 
 ```bash
-pip install websockets          # only third-party dependency
+pip install wxPython websockets
 python3 client_linux.py
 ```
 
-It works in any terminal (including over SSH) and is screen-reader friendly:
-status announcements are spoken through `spd-say`/`espeak`/`espeak-ng` when
-available, mirroring the Windows client's NVDA/SAPI accessibility support.
+### Terminal client (`client_linux_curses.py`)
+
+A curses-based TUI for use in any terminal, including over SSH, and
+screen-reader friendly: status announcements are spoken through
+`spd-say`/`espeak`/`espeak-ng` when available, mirroring the Windows client's
+NVDA/SAPI accessibility support.
+
+```bash
+pip install websockets
+python3 client_linux_curses.py
+```
 
 | Key | Action |
 |---|---|
@@ -116,10 +129,12 @@ available, mirroring the Windows client's NVDA/SAPI accessibility support.
 | F1 | Server uptime · F2 | Ping |
 | q | Quit (from main menu) |
 
-Sign in with a username/password, or choose "Sign in with christmaschild Account"
-to use OAuth. The full admin panel (accounts, ban/unban, promote/demote, reset
-password, set MOTD, official-account actions) and topic moderation (close /
-reopen / delete / admin-only / delete post) are supported.
+Both clients let you sign in with a username/password, or choose "Sign in with
+christmaschild Account" to use OAuth. The full admin panel (accounts,
+ban/unban, promote/demote, reset password, set MOTD, official-account actions)
+and topic moderation (close / reopen / delete / admin-only / delete post) are
+supported. The GUI also includes a username/password **Register** button
+(matching the Windows client), which the TUI does not.
 
 ## Development
 
